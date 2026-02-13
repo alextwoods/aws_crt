@@ -1,0 +1,6 @@
+# frozen_string_literal: true
+
+require "mkmf"
+require "rb_sys/mkmf"
+
+create_rust_makefile("aws_crt_s3_client/aws_crt_s3_client")
