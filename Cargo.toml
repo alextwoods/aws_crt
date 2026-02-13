@@ -3,5 +3,5 @@
 # in the ext/ directory.
 
 [workspace]
-members = ["./ext/aws_crt_s3_client"]
+members = ["./ext/aws_crt"]
 resolver = "2"

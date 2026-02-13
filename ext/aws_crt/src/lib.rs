@@ -109,7 +109,7 @@ fn crc64nvme(args: &[Value]) -> Result<u64, Error> {
 fn init(ruby: &Ruby) -> Result<(), Error> {
     init_crt();
 
-    let module = ruby.define_module("AwsCrtS3Client")?;
+    let module = ruby.define_module("AwsCrt")?;
     let checksums = module.define_module("Checksums")?;
 
     checksums.define_module_function("crc32", function!(crc32, -1))?;

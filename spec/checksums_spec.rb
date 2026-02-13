@@ -9,7 +9,7 @@ def int32_to_base64(num)
   Base64.encode64([num].pack("N"))
 end
 
-RSpec.describe AwsCrtS3Client::Checksums do
+RSpec.describe AwsCrt::Checksums do
   describe ".crc32" do
     [
       { str: "", expected: "AAAAAA==\n" },

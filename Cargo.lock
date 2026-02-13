@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws_crt_s3_client"
+name = "aws_crt"
 version = "0.1.0"
 dependencies = [
  "magnus",

@@ -2,7 +2,7 @@
 
 source "https://rubygems.org"
 
-# Specify your gem's dependencies in aws_crt_s3_client.gemspec
+# Specify your gem's dependencies in aws_crt.gemspec
 gemspec
 
 gem "rake", "~> 13.0"

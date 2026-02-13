@@ -13,10 +13,10 @@ require "rb_sys/extensiontask"
 
 task build: :compile
 
-GEMSPEC = Gem::Specification.load("aws_crt_s3_client.gemspec")
+GEMSPEC = Gem::Specification.load("aws_crt.gemspec")
 
-RbSys::ExtensionTask.new("aws_crt_s3_client", GEMSPEC) do |ext|
-  ext.lib_dir = "lib/aws_crt_s3_client"
+RbSys::ExtensionTask.new("aws_crt", GEMSPEC) do |ext|
+  ext.lib_dir = "lib/aws_crt"
 end
 
 namespace :crt do

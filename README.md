@@ -1,4 +1,4 @@
-# AwsCrtS3Client
+# AwsCrt
 
 High-performance CRC checksum functions for Ruby, backed by the
 [AWS Common Runtime (CRT)](https://docs.aws.amazon.com/sdkref/latest/guide/common-runtime.html).
@@ -21,7 +21,7 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 ┌──────────────┐
 │  Ruby caller  │
 └──────┬───────┘
-       │  AwsCrtS3Client::Checksums.crc32(data)
+       │  AwsCrt::Checksums.crc32(data)
 ┌──────▼───────┐
 │ Rust extension│  (magnus / rb_sys)
 │  src/lib.rs   │  reads Ruby string bytes in-place
@@ -51,8 +51,8 @@ compile time.
 Clone the repo with submodules:
 
 ```sh
-git clone --recurse-submodules https://github.com/awslabs/aws_crt_s3_client.git
-cd aws_crt_s3_client
+git clone --recurse-submodules https://github.com/awslabs/aws_crt.git
+cd aws_crt
 bundle install
 ```
 
@@ -72,7 +72,7 @@ bundle exec rake compile
 
 This runs `crt:compile` first (cmake builds the static CRT libraries into
 `crt/install/`), then compiles the Rust extension and places the resulting
-`.bundle`/`.so` in `lib/aws_crt_s3_client/`.
+`.bundle`/`.so` in `lib/aws_crt/`.
 
 ### Run tests
 
@@ -90,6 +90,12 @@ bundle exec rake rubocop
 
 ```sh
 bundle exec rake
+```
+
+### Run benchmarks
+
+```sh
+bundle exec rake benchmark
 ```
 
 ### Build the CRT libraries only
@@ -123,18 +129,18 @@ bundle exec rake install
 ## Usage
 
 ```ruby
-require "aws_crt_s3_client"
+require "aws_crt"
 
 data = "Hello world"
 
-AwsCrtS3Client::Checksums.crc32(data)        # => 2346098258
-AwsCrtS3Client::Checksums.crc32c(data)       # => 1924472696
-AwsCrtS3Client::Checksums.crc64nvme(data)    # => 4098937361808829147
+AwsCrt::Checksums.crc32(data)        # => 2346098258
+AwsCrt::Checksums.crc32c(data)       # => 1924472696
+AwsCrt::Checksums.crc64nvme(data)    # => 4098937361808829147
 
 # All three methods accept an optional second argument to continue
 # a running checksum (defaults to 0):
-part1 = AwsCrtS3Client::Checksums.crc32("Hello ")
-AwsCrtS3Client::Checksums.crc32("world", part1)  # same as crc32("Hello world")
+part1 = AwsCrt::Checksums.crc32("Hello ")
+AwsCrt::Checksums.crc32("world", part1)  # same as crc32("Hello world")
 ```
 
 ## License

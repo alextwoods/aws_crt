@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    aws_crt_s3_client (0.1.0)
+    aws_crt (0.1.0)
 
 GEM
   remote: https://rubygems.org/
@@ -70,7 +70,7 @@ PLATFORMS
 
 DEPENDENCIES
   aws-crt (~> 0)
-  aws_crt_s3_client!
+  aws_crt!
   benchmark-ips (~> 2.0)
   rake (~> 13.0)
   rake-compiler

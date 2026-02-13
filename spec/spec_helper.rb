@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "aws_crt_s3_client"
+require "aws_crt"
 
 RSpec.configure do |config|
   # Enable flags like --only-failures and --next-failure

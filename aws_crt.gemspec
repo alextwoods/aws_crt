@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
-require_relative "lib/aws_crt_s3_client/version"
+require_relative "lib/aws_crt/version"
 
 Gem::Specification.new do |spec|
-  spec.name = "aws_crt_s3_client"
-  spec.version = AwsCrtS3Client::VERSION
+  spec.name = "aws_crt"
+  spec.version = AwsCrt::VERSION
   spec.authors = ["Alex Woods"]
   spec.email = ["alexwoo@amazon.com"]
 
@@ -12,7 +12,7 @@ Gem::Specification.new do |spec|
   spec.description = "High-performance CRC32, CRC32C, and CRC64-NVME checksums " \
                      "using the AWS Common Runtime (CRT) with hardware acceleration, " \
                      "exposed to Ruby via a Rust native extension."
-  spec.homepage = "https://github.com/awslabs/aws_crt_s3_client"
+  spec.homepage = "https://github.com/awslabs/aws_crt"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.0.0"
   spec.required_rubygems_version = ">= 3.3.11"
@@ -43,5 +43,5 @@ Gem::Specification.new do |spec|
   spec.bindir = "exe"
   spec.executables = spec.files.grep(%r{\Aexe/}) { |f| File.basename(f) }
   spec.require_paths = ["lib"]
-  spec.extensions = ["ext/aws_crt_s3_client/Cargo.toml"]
+  spec.extensions = ["ext/aws_crt/Cargo.toml"]
 end
