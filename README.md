@@ -1,39 +1,151 @@
 # AwsCrtS3Client
 
-TODO: Delete this and the text below, and describe your gem
+High-performance CRC checksum functions for Ruby, backed by the
+[AWS Common Runtime (CRT)](https://docs.aws.amazon.com/sdkref/latest/guide/common-runtime.html).
+The CRT provides hardware-accelerated implementations (SSE4.2, AVX-512, CLMUL,
+ARM CRC, ARM PMULL) with efficient software fallbacks.
 
-Welcome to your new gem! In this directory, you'll find the files you need to be able to package up your Ruby library into a gem. Put your Ruby code in the file `lib/aws_crt_s3_client`. To experiment with that code, run `bin/console` for an interactive prompt.
+This gem exposes three checksum algorithms:
 
-## Installation
+- **CRC32** — Ethernet/gzip variant
+- **CRC32C** — Castagnoli/iSCSI variant
+- **CRC64-NVME** — CRC64-Rocksoft variant
 
-TODO: Replace `UPDATE_WITH_YOUR_GEM_NAME_IMMEDIATELY_AFTER_RELEASE_TO_RUBYGEMS_ORG` with your gem name right after releasing it to RubyGems.org. Please do not do it earlier due to security reasons. Alternatively, replace this section with instructions to install your gem from git if you don't plan to release to RubyGems.org.
+The native extension is written in Rust (using [magnus](https://github.com/matsadler/magnus)
+and [rb_sys](https://github.com/oxidize-rb/rb-sys)) and calls directly into
+the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 
-Install the gem and add to the application's Gemfile by executing:
+## Architecture
 
-    $ bundle add UPDATE_WITH_YOUR_GEM_NAME_IMMEDIATELY_AFTER_RELEASE_TO_RUBYGEMS_ORG
+```
+┌──────────────┐
+│  Ruby caller  │
+└──────┬───────┘
+       │  AwsCrtS3Client::Checksums.crc32(data)
+┌──────▼───────┐
+│ Rust extension│  (magnus / rb_sys)
+│  src/lib.rs   │  reads Ruby string bytes in-place
+└──────┬───────┘
+       │  extern "C" call
+┌──────▼───────┐
+│ aws-checksums │  CRT static library (hardware-accelerated)
+│ aws-c-common  │
+└──────────────┘
+```
 
-If bundler is not being used to manage dependencies, install the gem by executing:
+The CRT libraries (`aws-checksums` and its dependency `aws-c-common`) are
+included as git submodules under `crt/` and built as static libraries with
+cmake. The Rust `build.rs` links them into the final `.bundle`/`.so` at
+compile time.
 
-    $ gem install UPDATE_WITH_YOUR_GEM_NAME_IMMEDIATELY_AFTER_RELEASE_TO_RUBYGEMS_ORG
+## Prerequisites
+
+- Ruby >= 3.0
+- Rust (stable) — install via [rustup](https://rustup.rs/)
+- CMake >= 3.9
+- A C compiler (clang or gcc)
+- Bundler
+
+## Setup
+
+Clone the repo with submodules:
+
+```sh
+git clone --recurse-submodules https://github.com/awslabs/aws_crt_s3_client.git
+cd aws_crt_s3_client
+bundle install
+```
+
+If you already cloned without `--recurse-submodules`:
+
+```sh
+git submodule update --init --recursive
+```
+
+## Common Commands
+
+### Build everything (CRT libs + Rust extension)
+
+```sh
+bundle exec rake compile
+```
+
+This runs `crt:compile` first (cmake builds the static CRT libraries into
+`crt/install/`), then compiles the Rust extension and places the resulting
+`.bundle`/`.so` in `lib/aws_crt_s3_client/`.
+
+### Run tests
+
+```sh
+bundle exec rake spec
+```
+
+### Run the linter
+
+```sh
+bundle exec rake rubocop
+```
+
+### Run the full default task (compile + spec + rubocop)
+
+```sh
+bundle exec rake
+```
+
+### Build the CRT libraries only
+
+```sh
+bundle exec rake crt:compile
+```
+
+### Clean CRT build artifacts
+
+```sh
+bundle exec rake crt:clean
+```
+
+### Build the gem for distribution
+
+```sh
+bundle exec rake build
+```
+
+This produces a `.gem` file in `pkg/`. For platform gems with pre-built
+binaries, the CRT static libraries and compiled Rust extension are included
+so that end users don't need cmake or Rust installed.
+
+### Install locally
+
+```sh
+bundle exec rake install
+```
 
 ## Usage
 
-TODO: Write usage instructions here
+```ruby
+require "aws_crt_s3_client"
 
-## Development
+data = "Hello world"
 
-After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake spec` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.
+AwsCrtS3Client::Checksums.crc32(data)        # => 2346098258
+AwsCrtS3Client::Checksums.crc32c(data)       # => 1924472696
+AwsCrtS3Client::Checksums.crc64nvme(data)    # => 4098937361808829147
 
-To install this gem onto your local machine, run `bundle exec rake install`. To release a new version, update the version number in `version.rb`, and then run `bundle exec rake release`, which will create a git tag for the version, push git commits and the created tag, and push the `.gem` file to [rubygems.org](https://rubygems.org).
-
-## Contributing
-
-Bug reports and pull requests are welcome on GitHub at https://github.com/[USERNAME]/aws_crt_s3_client. This project is intended to be a safe, welcoming space for collaboration, and contributors are expected to adhere to the [code of conduct](https://github.com/[USERNAME]/aws_crt_s3_client/blob/master/CODE_OF_CONDUCT.md).
+# All three methods accept an optional second argument to continue
+# a running checksum (defaults to 0):
+part1 = AwsCrtS3Client::Checksums.crc32("Hello ")
+AwsCrtS3Client::Checksums.crc32("world", part1)  # same as crc32("Hello world")
+```
 
 ## License
 
-The gem is available as open source under the terms of the [MIT License](https://opensource.org/licenses/MIT).
+The gem is available as open source under the terms of the
+[MIT License](https://opensource.org/licenses/MIT).
+
+The AWS CRT libraries are licensed under [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0).
 
 ## Code of Conduct
 
-Everyone interacting in the AwsCrtS3Client project's codebases, issue trackers, chat rooms and mailing lists is expected to follow the [code of conduct](https://github.com/[USERNAME]/aws_crt_s3_client/blob/master/CODE_OF_CONDUCT.md).
+Everyone interacting in this project's codebases, issue trackers, chat rooms,
+and mailing lists is expected to follow the
+[code of conduct](CODE_OF_CONDUCT.md).

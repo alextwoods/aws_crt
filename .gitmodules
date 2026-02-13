@@ -1,0 +1,6 @@
+[submodule "crt/aws-c-common"]
+	path = crt/aws-c-common
+	url = https://github.com/awslabs/aws-c-common.git
+[submodule "crt/aws-checksums"]
+	path = crt/aws-checksums
+	url = https://github.com/awslabs/aws-checksums.git

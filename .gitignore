@@ -15,3 +15,7 @@ target/
 
 # rspec failure tracking
 .rspec_status
+
+# CRT build artifacts
+/crt/build/
+/crt/install/
