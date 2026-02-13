@@ -7,7 +7,14 @@ GEM
   remote: https://rubygems.org/
   specs:
     ast (2.4.3)
+    aws-crt (0.4.0)
+      ffi
+    aws-crt (0.4.0-arm64-darwin)
+      ffi
+    benchmark-ips (2.14.0)
     diff-lcs (1.6.2)
+    ffi (1.17.3)
+    ffi (1.17.3-arm64-darwin)
     json (2.18.1)
     language_server-protocol (3.17.0.5)
     lint_roller (1.1.0)
@@ -62,7 +69,9 @@ PLATFORMS
   ruby
 
 DEPENDENCIES
+  aws-crt (~> 0)
   aws_crt_s3_client!
+  benchmark-ips (~> 2.0)
   rake (~> 13.0)
   rake-compiler
   rb_sys (~> 0.9.63)

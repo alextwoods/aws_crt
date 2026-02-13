@@ -55,4 +55,9 @@ task install: :build do
   end
 end
 
+desc "Run checksum benchmarks (vs aws-crt FFI and Zlib)"
+task benchmark: :compile do
+  ruby "benchmarks/checksums.rb"
+end
+
 task default: %i[compile spec rubocop]

@@ -13,3 +13,8 @@ gem "rb_sys", "~> 0.9.63"
 gem "rspec", "~> 3.0"
 
 gem "rubocop", "~> 1.21"
+
+group :benchmark do
+  gem "aws-crt", "~> 0"
+  gem "benchmark-ips", "~> 2.0"
+end
