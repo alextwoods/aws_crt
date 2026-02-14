@@ -60,4 +60,9 @@ task benchmark: :compile do
   ruby "benchmarks/checksums.rb"
 end
 
+desc "Run CBOR benchmarks (vs aws-sdk-core pure Ruby and cbor gem)"
+task "benchmark:cbor": :compile do
+  ruby "benchmarks/cbor.rb"
+end
+
 task default: %i[compile spec rubocop]

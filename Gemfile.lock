@@ -11,13 +11,30 @@ GEM
       ffi
     aws-crt (0.4.0-arm64-darwin)
       ffi
+    aws-eventstream (1.4.0)
+    aws-partitions (1.1213.0)
+    aws-sdk-core (3.242.0)
+      aws-eventstream (~> 1, >= 1.3.0)
+      aws-partitions (~> 1, >= 1.992.0)
+      aws-sigv4 (~> 1.9)
+      base64
+      bigdecimal
+      jmespath (~> 1, >= 1.6.1)
+      logger
+    aws-sigv4 (1.12.1)
+      aws-eventstream (~> 1, >= 1.0.2)
+    base64 (0.3.0)
     benchmark-ips (2.14.0)
+    bigdecimal (4.0.1)
+    cbor (0.5.10.1)
     diff-lcs (1.6.2)
     ffi (1.17.3)
     ffi (1.17.3-arm64-darwin)
+    jmespath (1.6.2)
     json (2.18.1)
     language_server-protocol (3.17.0.5)
     lint_roller (1.1.0)
+    logger (1.7.0)
     parallel (1.27.0)
     parser (3.3.10.1)
       ast (~> 2.4.1)
@@ -70,8 +87,10 @@ PLATFORMS
 
 DEPENDENCIES
   aws-crt (~> 0)
+  aws-sdk-core (~> 3)
   aws_crt!
   benchmark-ips (~> 2.0)
+  cbor (~> 0.5)
   rake (~> 13.0)
   rake-compiler
   rb_sys (~> 0.9.63)

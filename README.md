@@ -1,15 +1,12 @@
 # AwsCrt
 
-High-performance CRC checksum functions for Ruby, backed by the
+High-performance native extensions for Ruby, backed by Rust and the
 [AWS Common Runtime (CRT)](https://docs.aws.amazon.com/sdkref/latest/guide/common-runtime.html).
-The CRT provides hardware-accelerated implementations (SSE4.2, AVX-512, CLMUL,
-ARM CRC, ARM PMULL) with efficient software fallbacks.
 
-This gem exposes three checksum algorithms:
+This gem provides:
 
-- **CRC32** — Ethernet/gzip variant
-- **CRC32C** — Castagnoli/iSCSI variant
-- **CRC64-NVME** — CRC64-Rocksoft variant
+- **CRC Checksums** — Hardware-accelerated CRC32, CRC32C, and CRC64-NVME via the CRT (SSE4.2, AVX-512, CLMUL, ARM CRC, ARM PMULL) with efficient software fallbacks.
+- **CBOR Encoder/Decoder** — A fast CBOR (RFC 8949) encoder and decoder implemented in Rust, compatible with the `Aws::Cbor` interface from `aws-sdk-core`.
 
 The native extension is written in Rust (using [magnus](https://github.com/matsadler/magnus)
 and [rb_sys](https://github.com/oxidize-rb/rb-sys)) and calls directly into
@@ -22,21 +19,127 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 │  Ruby caller  │
 └──────┬───────┘
        │  AwsCrt::Checksums.crc32(data)
+       │  AwsCrt::Cbor.encode(data)
 ┌──────▼───────┐
 │ Rust extension│  (magnus / rb_sys)
 │  src/lib.rs   │  reads Ruby string bytes in-place
+│  src/cbor.rs  │  CBOR encode/decode with raw rb_sys API
 └──────┬───────┘
-       │  extern "C" call
+       │  extern "C" call (checksums only)
 ┌──────▼───────┐
 │ aws-checksums │  CRT static library (hardware-accelerated)
 │ aws-c-common  │
 └──────────────┘
 ```
 
+## CRT Libraries
+
 The CRT libraries (`aws-checksums` and its dependency `aws-c-common`) are
-included as git submodules under `crt/` and built as static libraries with
-cmake. The Rust `build.rs` links them into the final `.bundle`/`.so` at
-compile time.
+included as git submodules under `crt/`:
+
+```
+crt/
+├── CMakeLists.txt          # Top-level cmake that builds both libraries
+├── aws-c-common/           # Git submodule — core CRT utilities
+└── aws-checksums/          # Git submodule — CRC implementations
+```
+
+### How they're built
+
+The build is driven by cmake and orchestrated through Rake:
+
+1. `rake crt:compile` runs cmake to configure and build both C libraries as
+   static archives (`.a` files) into `crt/install/`. The cmake project
+   (`crt/CMakeLists.txt`) adds `aws-c-common` first (as a dependency), then
+   `aws-checksums`. Shared libraries and tests are disabled — only the static
+   libraries and headers are installed.
+
+2. `rake compile` depends on `crt:compile`, so the CRT libraries are always
+   built before the Rust extension. The Rust `build.rs` script locates the
+   pre-built static libraries under `crt/install/lib/` and tells Cargo to
+   link them into the final `.bundle`/`.so`. It also links platform-specific
+   system libraries (CoreFoundation/Security on macOS, pthread/dl on Linux).
+
+3. The Rust extension (`ext/aws_crt/`) uses `rb_sys` and `magnus` to bridge
+   between Ruby and Rust. The `extconf.rb` is minimal — it delegates to
+   `rb_sys/mkmf` which handles Cargo integration. The Rust code in
+   `src/lib.rs` declares `extern "C"` bindings to the CRT checksum functions
+   and calls them directly.
+
+### How they're included in the gem
+
+When building the gem for distribution (`rake build`), the gemspec
+automatically includes the pre-built CRT static libraries and headers from
+`crt/install/` if they exist. This means end users installing a pre-built
+platform gem don't need cmake installed — only Rust (for the native extension
+compilation via `rb_sys`).
+
+For source gem installs, the full build chain runs: cmake builds the CRT
+libraries, then Cargo compiles the Rust extension and statically links them.
+
+## CBOR Performance
+
+The CBOR encoder and decoder are optimized for minimal overhead on the
+Ruby-to-Rust boundary. Key optimizations:
+
+### Encoding
+
+- **Raw `rb_sys` API** — Bypasses magnus wrapper overhead for type checking
+  and value extraction. Uses `FIXNUM_P`/`FIX2LONG` for integers,
+  `RSTRING_PTR`/`RSTRING_LEN` for strings, `RARRAY_CONST_PTR` for arrays,
+  and `rb_hash_foreach` for hash iteration — all avoiding Ruby method calls
+  and intermediate allocations.
+- **Cached class references** — `Time`, `BigDecimal`, and `Tagged` class
+  VALUEs are resolved once at init and stored in statics, avoiding repeated
+  constant lookups during encoding.
+- **Module-level `encode`/`decode` functions** — `AwsCrt::Cbor.encode(data)`
+  and `AwsCrt::Cbor.decode(bytes)` skip Ruby object allocation entirely,
+  operating on a stack-allocated `Vec<u8>` buffer.
+- **Auto float precision** — Floats that can be represented exactly as
+  single-precision are encoded as 4 bytes instead of 8, matching the CBOR
+  gem's behavior and reducing output size.
+
+### Decoding
+
+- **Inlined fast paths** — Small integers (0–23, -1–-24) and short text
+  strings (length < 24) are decoded inline in the main dispatch loop,
+  avoiding function call overhead for the most common CBOR types.
+- **Inlined float decode** — Single and double precision floats are decoded
+  directly in the `decode_value` match arm rather than through helper
+  functions.
+- **Direct Ruby object creation** — Uses `rb_float_new`, `LONG2FIX`,
+  `rb_enc_str_new`, `rb_ary_new_capa`, `rb_hash_new_capa`, and
+  `rb_hash_aset` directly, bypassing magnus value conversion.
+- **Inlined map key decode** — Hash keys (typically short text strings) are
+  decoded inline in the map decode loop, avoiding a function call per
+  key-value pair.
+
+### Benchmark results
+
+Measured on Apple M3 Pro, Ruby 3.3.3, comparing against the
+[cbor](https://rubygems.org/gems/cbor) C extension gem and Ruby's built-in
+JSON:
+
+**Encode** (iterations/second, higher is better):
+
+| Payload | AwsCrt::Cbor.encode | CBOR gem (C) | JSON.dump | Aws::Cbor (pure Ruby) |
+|---------|--------------------:|-------------:|----------:|----------------------:|
+| Small (3-key int map) | 6.67M | 4.49M | 4.43M | 317k |
+| Medium (50-key string map) | 618k | 722k | 608k | 23k |
+| Large (nested mixed) | 45.2k | 47.8k | 44.3k | 1.3k |
+
+**Decode** (iterations/second, higher is better):
+
+| Payload | AwsCrt::Cbor.decode | CBOR gem (C) | JSON.parse | Aws::Cbor (pure Ruby) |
+|---------|--------------------:|-------------:|-----------:|----------------------:|
+| Small (3-key int map) | 3.45M | 2.45M | 3.97M | 260k |
+| Medium (50-key string map) | 150k | 148k | 210k | 17k |
+| Large (nested mixed) | 10.5k | 12.7k | 21.8k | 809 |
+
+Encoding is 1.5x faster than the CBOR C gem on small payloads and
+competitive on larger ones. Decoding consistently beats the CBOR C gem and
+is within 1.2–2x of JSON (which benefits from a monolithic C state machine
+parser with less per-value function dispatch overhead).
 
 ## Prerequisites
 
@@ -95,7 +198,8 @@ bundle exec rake
 ### Run benchmarks
 
 ```sh
-bundle exec rake benchmark
+bundle exec rake benchmark          # checksums
+bundle exec rake benchmark:cbor     # CBOR encode/decode
 ```
 
 ### Build the CRT libraries only
@@ -128,6 +232,8 @@ bundle exec rake install
 
 ## Usage
 
+### Checksums
+
 ```ruby
 require "aws_crt"
 
@@ -142,6 +248,74 @@ AwsCrt::Checksums.crc64nvme(data)    # => 4098937361808829147
 part1 = AwsCrt::Checksums.crc32("Hello ")
 AwsCrt::Checksums.crc32("world", part1)  # same as crc32("Hello world")
 ```
+
+### CBOR
+
+The CBOR encoder and decoder follow the same public interface as
+`Aws::Cbor::Encoder` and `Aws::Cbor::Decoder` from
+[aws-sdk-core](https://github.com/aws/aws-sdk-ruby), making them a
+drop-in replacement.
+
+#### Module functions (recommended)
+
+The fastest way to encode and decode — no object allocation overhead:
+
+```ruby
+require "aws_crt"
+
+data = { "name" => "Alice", "age" => 30, "scores" => [95, 87, 92] }
+
+# Encode
+encoded = AwsCrt::Cbor.encode(data)
+# => CBOR binary string
+
+# Decode
+decoded = AwsCrt::Cbor.decode(encoded)
+# => {"name"=>"Alice", "age"=>30, "scores"=>[95, 87, 92]}
+```
+
+#### Encoder/Decoder classes
+
+For compatibility with the `Aws::Cbor` interface, or when you need to
+encode multiple values into a single buffer:
+
+```ruby
+# Encode
+encoder = AwsCrt::Cbor::Encoder.new
+encoder.add({ "id" => 1 })
+encoder.add({ "id" => 2 })
+bytes = encoder.bytes
+
+# Decode
+decoder = AwsCrt::Cbor::Decoder.new(encoded)
+decoded = decoder.decode
+```
+
+#### Supported types
+
+| Ruby type    | CBOR encoding                          |
+|--------------|----------------------------------------|
+| Integer      | Unsigned/negative integer, or bignum tag (2/3) for arbitrary precision |
+| Float        | Single or double precision (auto-selected) |
+| String       | Text string (UTF-8) or byte string (BINARY encoding) |
+| Symbol       | Text string                            |
+| Array        | Array                                  |
+| Hash         | Map                                    |
+| true/false   | Simple value                           |
+| nil          | Simple value (null)                    |
+| Time         | Tag 1 (epoch-based date/time)          |
+| BigDecimal   | Tag 4 (decimal fraction)               |
+| Tagged       | Tag with arbitrary value               |
+
+#### Error classes
+
+All errors inherit from `AwsCrt::Cbor::Error`:
+
+- `OutOfBytesError` — input buffer exhausted during decode
+- `ExtraBytesError` — trailing bytes after a complete CBOR item
+- `UnknownTypeError` — encoder encountered an unsupported Ruby type
+- `UnexpectedBreakCodeError` — break code outside indefinite-length context
+- `UnexpectedAdditionalInformationError` — invalid additional info field
 
 ## License
 

@@ -16,5 +16,7 @@ gem "rubocop", "~> 1.21"
 
 group :benchmark do
   gem "aws-crt", "~> 0"
+  gem "aws-sdk-core", "~> 3"
   gem "benchmark-ips", "~> 2.0"
+  gem "cbor", "~> 0.5"
 end

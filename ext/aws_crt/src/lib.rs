@@ -2,6 +2,8 @@ use magnus::{
     function, prelude::*, scan_args::scan_args, Error, RString, Ruby, TryConvert, Value,
 };
 
+mod cbor;
+
 // FFI bindings to the AWS CRT checksum C functions.
 // These are provided by the pre-built static libraries
 // (aws-checksums and aws-c-common).
@@ -115,6 +117,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     checksums.define_module_function("crc32", function!(crc32, -1))?;
     checksums.define_module_function("crc32c", function!(crc32c, -1))?;
     checksums.define_module_function("crc64nvme", function!(crc64nvme, -1))?;
+
+    cbor::init(ruby, &module)?;
 
     Ok(())
 }

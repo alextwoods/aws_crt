@@ -16,6 +16,7 @@ name = "aws_crt"
 version = "0.1.0"
 dependencies = [
  "magnus",
+ "rb-sys",
 ]
 
 [[package]]
