@@ -20,6 +20,7 @@ group :benchmark do
   gem "aws-sdk-core", "~> 3"
   gem "aws-sdk-dynamodb", "~> 1"
   gem "aws-sdk-s3", "~> 1"
+  gem "rexml"
   gem "benchmark-ips", "~> 2.0"
   gem "cbor", "~> 0.5"
 end

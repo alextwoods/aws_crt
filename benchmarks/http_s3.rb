@@ -10,7 +10,7 @@
 
 require "benchmark/ips"
 require "aws-sdk-s3"
-require "aws_crt"
+require "aws_crt/http/plugin"
 
 BUCKET = ENV.fetch("BENCH_S3_BUCKET", "test-bucket-alexwoo-2")
 

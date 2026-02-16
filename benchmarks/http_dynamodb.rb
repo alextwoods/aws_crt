@@ -13,7 +13,7 @@
 
 require "benchmark/ips"
 require "aws-sdk-dynamodb"
-require "aws_crt"
+require "aws_crt/http/plugin"
 require "securerandom"
 
 TABLE = ENV.fetch(
