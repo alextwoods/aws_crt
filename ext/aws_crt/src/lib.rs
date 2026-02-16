@@ -3,6 +3,13 @@ use magnus::{
 };
 
 mod cbor;
+pub mod connection_manager;
+pub mod error;
+pub mod http;
+pub mod pool;
+pub mod proxy;
+pub mod runtime;
+pub mod tls;
 
 // FFI bindings to the AWS CRT checksum C functions.
 // These are provided by the pre-built static libraries
@@ -119,6 +126,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     checksums.define_module_function("crc64nvme", function!(crc64nvme, -1))?;
 
     cbor::init(ruby, &module)?;
+
+    // HTTP module and error hierarchy
+    let http = module.define_module("Http")?;
+    error::define_http_errors(ruby, &http)?;
+    pool::define_connection_pool(ruby, &http)?;
 
     Ok(())
 }

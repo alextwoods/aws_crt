@@ -8,8 +8,9 @@ Gem::Specification.new do |spec|
   spec.authors = ["Alex Woods"]
   spec.email = ["alexwoo@amazon.com"]
 
-  spec.summary = "Ruby bindings for AWS CRT checksum functions"
-  spec.description = "High-performance CRC32, CRC32C, and CRC64-NVME checksums " \
+  spec.summary = "Ruby bindings for AWS CRT checksums, CBOR, and HTTP client"
+  spec.description = "High-performance CRC32, CRC32C, and CRC64-NVME checksums, " \
+                     "CBOR encoding, and an HTTP/1.1 client with connection pooling " \
                      "using the AWS Common Runtime (CRT) with hardware acceleration, " \
                      "exposed to Ruby via a Rust native extension."
   spec.homepage = "https://github.com/awslabs/aws_crt"

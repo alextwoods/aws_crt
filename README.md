@@ -7,6 +7,7 @@ This gem provides:
 
 - **CRC Checksums** — Hardware-accelerated CRC32, CRC32C, and CRC64-NVME via the CRT (SSE4.2, AVX-512, CLMUL, ARM CRC, ARM PMULL) with efficient software fallbacks.
 - **CBOR Encoder/Decoder** — A fast CBOR (RFC 8949) encoder and decoder implemented in Rust, compatible with the `Aws::Cbor` interface from `aws-sdk-core`.
+- **HTTP Client** — A CRT-backed HTTP/1.1 client with connection pooling, TLS, proxy support, and streaming responses. Drop-in replacement for the default `Net::HTTP` handler in the AWS SDK for Ruby V3.
 
 The native extension is written in Rust (using [magnus](https://github.com/matsadler/magnus)
 and [rb_sys](https://github.com/oxidize-rb/rb-sys)) and calls directly into
@@ -316,6 +317,71 @@ All errors inherit from `AwsCrt::Cbor::Error`:
 - `UnknownTypeError` — encoder encountered an unsupported Ruby type
 - `UnexpectedBreakCodeError` — break code outside indefinite-length context
 - `UnexpectedAdditionalInformationError` — invalid additional info field
+
+### HTTP Client
+
+#### Auto-patch (recommended)
+
+Replace the default `Net::HTTP` handler on all AWS service clients with a single require:
+
+```ruby
+require "aws_crt/http"
+
+# All AWS clients now use the CRT HTTP client automatically
+client = Aws::S3::Client.new(region: "us-east-1")
+```
+
+This patches both currently-loaded and future-loaded service clients.
+
+#### Manual plugin registration
+
+For more control, register the plugin on specific clients:
+
+```ruby
+require "aws_crt/http/plugin"
+
+Aws::S3::Client.add_plugin(AwsCrt::Http::Plugin)
+client = Aws::S3::Client.new(region: "us-east-1")
+```
+
+#### Configuration options
+
+The plugin accepts the same options as the SDK's default HTTP handler:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `http_open_timeout` | 60 | Connection timeout in seconds |
+| `http_read_timeout` | 60 | Read timeout in seconds |
+| `ssl_verify_peer` | true | Verify TLS certificates |
+| `ssl_ca_bundle` | nil | Path to custom CA bundle |
+| `http_proxy` | nil | Proxy config hash (`{host:, port:, username:, password:}`) |
+| `max_connections` | 25 | Max concurrent connections per endpoint |
+| `max_connection_idle_ms` | 60000 | Idle connection timeout in milliseconds |
+
+#### Direct pool usage
+
+You can also use the connection pool directly without the SDK:
+
+```ruby
+require "aws_crt"
+
+pool = AwsCrt::Http::ConnectionPool.new("https://example.com")
+status, headers, body = pool.request("GET", "/path", [["Host", "example.com"]])
+
+# Streaming response
+pool.request("GET", "/large", [["Host", "example.com"]]) do |chunk|
+  # process each chunk as it arrives
+end
+```
+
+#### Error classes
+
+HTTP errors inherit from `AwsCrt::Http::Error`:
+
+- `ConnectionError` — DNS failures, connection refused
+- `TimeoutError` — connect or read timeout exceeded
+- `TlsError` — TLS handshake or certificate failures
+- `ProxyError` — proxy connection or authentication failures
 
 ## License
 

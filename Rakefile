@@ -20,7 +20,8 @@ RbSys::ExtensionTask.new("aws_crt", GEMSPEC) do |ext|
 end
 
 namespace :crt do
-  desc "Compile the CRT static libraries (aws-checksums, aws-c-common)"
+  desc "Compile the CRT static libraries " \
+       "(aws-c-common, aws-checksums, aws-c-cal, aws-c-io, aws-c-compression, aws-c-http)"
   task :compile do
     require_relative "ext/crt_compile"
     root_dir = File.expand_path(__dir__)
@@ -55,14 +56,36 @@ task install: :build do
   end
 end
 
-desc "Run checksum benchmarks (vs aws-crt FFI and Zlib)"
-task benchmark: :compile do
-  ruby "benchmarks/checksums.rb"
+namespace :benchmark do
+  desc "Run checksum benchmarks (vs aws-crt FFI and Zlib)"
+  task checksums: :compile do
+    ruby "benchmarks/checksums.rb"
+  end
+
+  desc "Run CBOR benchmarks (vs aws-sdk-core pure Ruby and cbor gem)"
+  task cbor: :compile do
+    ruby "benchmarks/cbor.rb"
+  end
+
+  desc "Run HTTP benchmarks (CRT vs Net::HTTP, local server)"
+  task http: :compile do
+    ruby "benchmarks/http.rb"
+  end
+
+  namespace :http do
+    desc "Run S3 HTTP benchmarks (Net::HTTP vs CRT plugin)"
+    task s3: :compile do
+      ruby "benchmarks/http_s3.rb"
+    end
+
+    desc "Run DynamoDB HTTP benchmarks (Net::HTTP vs CRT plugin)"
+    task dynamodb: :compile do
+      ruby "benchmarks/http_dynamodb.rb"
+    end
+  end
 end
 
-desc "Run CBOR benchmarks (vs aws-sdk-core pure Ruby and cbor gem)"
-task "benchmark:cbor": :compile do
-  ruby "benchmarks/cbor.rb"
-end
+desc "Run all benchmarks"
+task benchmark: %i[benchmark:checksums benchmark:cbor benchmark:http]
 
 task default: %i[compile spec rubocop]

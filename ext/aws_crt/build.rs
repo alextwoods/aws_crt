@@ -39,8 +39,29 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
     // Link the CRT static libraries (order matters: dependents first)
-    println!("cargo:rustc-link-lib=static=aws-checksums");
-    println!("cargo:rustc-link-lib=static=aws-c-common");
+    // HTTP stack
+    let required_libs = [
+        "aws-c-http",
+        "aws-c-compression",
+        "aws-c-io",
+        "aws-c-cal",
+        // Existing
+        "aws-checksums",
+        "aws-c-common",
+    ];
+
+    for lib in &required_libs {
+        let lib_file = lib_dir.join(format!("lib{}.a", lib));
+        if !lib_file.exists() {
+            panic!(
+                "Required CRT library '{}' not found at {}.\n\
+                 Please rebuild the CRT libraries: rake crt:compile",
+                lib,
+                lib_file.display()
+            );
+        }
+        println!("cargo:rustc-link-lib=static={}", lib);
+    }
 
     // Platform-specific system libraries
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -48,8 +69,20 @@ fn main() {
         "macos" => {
             println!("cargo:rustc-link-lib=framework=CoreFoundation");
             println!("cargo:rustc-link-lib=framework=Security");
+            println!("cargo:rustc-link-lib=framework=Network");
         }
         "linux" => {
+            // s2n-tls and its libcrypto dependency
+            let s2n_lib = lib_dir.join("libs2n.a");
+            if !s2n_lib.exists() {
+                panic!(
+                    "Required CRT library 's2n' not found at {}.\n\
+                     Please rebuild the CRT libraries: rake crt:compile",
+                    s2n_lib.display()
+                );
+            }
+            println!("cargo:rustc-link-lib=static=s2n");
+            println!("cargo:rustc-link-lib=dylib=crypto");
             println!("cargo:rustc-link-lib=dylib=pthread");
             println!("cargo:rustc-link-lib=dylib=dl");
         }

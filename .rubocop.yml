@@ -13,7 +13,13 @@ Metrics/BlockLength:
   Exclude:
     - "spec/**/*"
     - "*.gemspec"
+    - "benchmarks/**/*"
 
 Metrics/MethodLength:
   Exclude:
     - "ext/**/*"
+    - "benchmarks/**/*"
+
+Metrics/AbcSize:
+  Exclude:
+    - "benchmarks/**/*"

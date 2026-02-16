@@ -21,6 +21,16 @@ GEM
       bigdecimal
       jmespath (~> 1, >= 1.6.1)
       logger
+    aws-sdk-dynamodb (1.113.0)
+      aws-sdk-core (~> 3, >= 3.197.0)
+      aws-sigv4 (~> 1.1)
+    aws-sdk-kms (1.120.0)
+      aws-sdk-core (~> 3, >= 3.241.3)
+      aws-sigv4 (~> 1.5)
+    aws-sdk-s3 (1.211.0)
+      aws-sdk-core (~> 3, >= 3.241.3)
+      aws-sdk-kms (~> 1)
+      aws-sigv4 (~> 1.5)
     aws-sigv4 (1.12.1)
       aws-eventstream (~> 1, >= 1.0.2)
     base64 (0.3.0)
@@ -46,6 +56,7 @@ GEM
     rake-compiler (1.3.1)
       rake
     rake-compiler-dock (1.11.0)
+    rantly (3.0.0)
     rb_sys (0.9.124)
       rake-compiler-dock (= 1.11.0)
     regexp_parser (2.11.3)
@@ -88,11 +99,14 @@ PLATFORMS
 DEPENDENCIES
   aws-crt (~> 0)
   aws-sdk-core (~> 3)
+  aws-sdk-dynamodb (~> 1)
+  aws-sdk-s3 (~> 1)
   aws_crt!
   benchmark-ips (~> 2.0)
   cbor (~> 0.5)
   rake (~> 13.0)
   rake-compiler
+  rantly (~> 3.0)
   rb_sys (~> 0.9.63)
   rspec (~> 3.0)
   rubocop (~> 1.21)
