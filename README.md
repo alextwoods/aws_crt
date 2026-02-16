@@ -16,56 +16,101 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 ## Architecture
 
 ```
-┌──────────────┐
-│  Ruby caller  │
-└──────┬───────┘
-       │  AwsCrt::Checksums.crc32(data)
-       │  AwsCrt::Cbor.encode(data)
-┌──────▼───────┐
-│ Rust extension│  (magnus / rb_sys)
-│  src/lib.rs   │  reads Ruby string bytes in-place
-│  src/cbor.rs  │  CBOR encode/decode with raw rb_sys API
-└──────┬───────┘
-       │  extern "C" call (checksums only)
-┌──────▼───────┐
-│ aws-checksums │  CRT static library (hardware-accelerated)
-│ aws-c-common  │
-└──────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  Ruby caller                                            │
+│  AwsCrt::Checksums.crc32(data)                          │
+│  AwsCrt::Cbor.encode(data)                              │
+│  Aws::S3::Client.new  (with CRT HTTP handler)           │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────┐
+│  Ruby integration layer                                  │
+│  lib/aws_crt/http/handler.rb     Seahorse :send handler  │
+│  lib/aws_crt/http/plugin.rb      SDK plugin + config     │
+│  lib/aws_crt/http/patcher.rb     auto-patch on require   │
+│  lib/aws_crt/http/connection_pool_manager.rb             │
+│  lib/aws_crt/http/connection_pool.rb                     │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────┐
+│  Rust extension  (magnus / rb_sys)                       │
+│  src/lib.rs               entry point + checksum FFI     │
+│  src/cbor.rs              CBOR encode/decode             │
+│  src/http.rs              request/response execution     │
+│  src/connection_manager.rs  CRT connection pool wrapper  │
+│  src/runtime.rs           shared CRT resources (once)    │
+│  src/tls.rs               TLS context management         │
+│  src/proxy.rs             proxy configuration            │
+│  src/pool.rs              Ruby-facing pool class          │
+│  src/error.rs             CRT → Ruby error translation   │
+└──────────────────────────┬──────────────────────────────┘
+                           │  extern "C" / FFI calls
+┌──────────────────────────▼──────────────────────────────┐
+│  CRT C static libraries                                  │
+│  aws-c-http          HTTP/1.1 protocol + conn manager    │
+│  aws-c-compression   HTTP content encoding               │
+│  aws-c-io            event loops, TLS, sockets, DNS      │
+│  aws-c-cal           crypto abstraction layer             │
+│  aws-checksums       hardware-accelerated CRC             │
+│  aws-c-common        allocators, byte buffers, logging    │
+│  s2n-tls             TLS provider (Linux only)            │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ## CRT Libraries
 
-The CRT libraries (`aws-checksums` and its dependency `aws-c-common`) are
-included as git submodules under `crt/`:
+The CRT libraries are included as git submodules under `crt/`. The full
+dependency graph for HTTP support is:
 
 ```
 crt/
-├── CMakeLists.txt          # Top-level cmake that builds both libraries
-├── aws-c-common/           # Git submodule — core CRT utilities
-└── aws-checksums/          # Git submodule — CRC implementations
+├── CMakeLists.txt          # Top-level cmake that builds all libraries
+├── aws-c-common/           # Core CRT utilities (allocators, byte buffers, logging)
+├── aws-checksums/          # Hardware-accelerated CRC implementations
+├── aws-c-cal/              # Crypto abstraction layer
+├── aws-c-io/               # Event loops, sockets, TLS, DNS resolver
+├── aws-c-compression/      # HTTP content encoding (huffman, etc.)
+├── aws-c-http/             # HTTP/1.1 protocol and connection manager
+└── s2n-tls/                # TLS provider (Linux only; macOS uses Security.framework)
+```
+
+The build order follows the CRT dependency graph:
+
+```
+aws-c-common
+├── aws-checksums
+├── aws-c-cal
+│   └── aws-c-io  (+ s2n-tls on Linux)
+│       ├── aws-c-compression
+│       └── aws-c-http
 ```
 
 ### How they're built
 
 The build is driven by cmake and orchestrated through Rake:
 
-1. `rake crt:compile` runs cmake to configure and build both C libraries as
+1. `rake crt:compile` runs cmake to configure and build all CRT C libraries as
    static archives (`.a` files) into `crt/install/`. The cmake project
-   (`crt/CMakeLists.txt`) adds `aws-c-common` first (as a dependency), then
-   `aws-checksums`. Shared libraries and tests are disabled — only the static
-   libraries and headers are installed.
+   (`crt/CMakeLists.txt`) adds libraries in dependency order: `aws-c-common`
+   first, then `aws-checksums`, `aws-c-cal`, `s2n-tls` (Linux only),
+   `aws-c-io`, `aws-c-compression`, and `aws-c-http`. Shared libraries and
+   tests are disabled — only the static libraries and headers are installed.
 
 2. `rake compile` depends on `crt:compile`, so the CRT libraries are always
    built before the Rust extension. The Rust `build.rs` script locates the
    pre-built static libraries under `crt/install/lib/` and tells Cargo to
-   link them into the final `.bundle`/`.so`. It also links platform-specific
-   system libraries (CoreFoundation/Security on macOS, pthread/dl on Linux).
+   link them into the final `.bundle`/`.so` in the correct dependency order
+   (dependents first: `aws-c-http` → `aws-c-compression` → `aws-c-io` →
+   `aws-c-cal` → `aws-checksums` → `aws-c-common`). On Linux, `s2n-tls`
+   and `libcrypto` are also linked. On macOS, Security.framework and
+   CoreFoundation.framework are linked for TLS and platform services.
 
 3. The Rust extension (`ext/aws_crt/`) uses `rb_sys` and `magnus` to bridge
-   between Ruby and Rust. The `extconf.rb` is minimal — it delegates to
-   `rb_sys/mkmf` which handles Cargo integration. The Rust code in
-   `src/lib.rs` declares `extern "C"` bindings to the CRT checksum functions
-   and calls them directly.
+   between Ruby and Rust. The Rust code declares `extern "C"` bindings to
+   CRT checksum functions (in `src/lib.rs`) and CRT HTTP APIs (in
+   `src/http.rs`, `src/connection_manager.rs`, `src/runtime.rs`, `src/tls.rs`,
+   `src/proxy.rs`). The HTTP path releases the GVL during blocking I/O so
+   other Ruby threads can run concurrently.
 
 ### How they're included in the gem
 
@@ -159,6 +204,7 @@ git clone --recurse-submodules https://github.com/awslabs/aws_crt.git
 cd aws_crt
 bundle install
 ```
+(Note, if you get errors you may need to do `rake clobber build install`)
 
 If you already cloned without `--recurse-submodules`:
 

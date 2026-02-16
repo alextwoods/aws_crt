@@ -88,4 +88,14 @@ end
 desc "Run all benchmarks"
 task benchmark: %i[benchmark:checksums benchmark:cbor benchmark:http]
 
+desc "Start an interactive IRB session with the gem loaded and benchmark gems available"
+task console: :compile do
+  require "bundler/setup"
+  # Require benchmark group gems
+  Bundler.require(:benchmark)
+
+  exec "ruby", "-I", "lib", "-r", "aws_crt", "-r", "irb", "-e", "IRB.start"
+end
+task c: :console
+
 task default: %i[compile spec rubocop]

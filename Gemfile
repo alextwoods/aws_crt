@@ -16,7 +16,7 @@ gem "rspec", "~> 3.0"
 gem "rubocop", "~> 1.21"
 
 group :benchmark do
-  gem "aws-crt", "~> 0"
+  gem "aws-crt", "~> 0" # existing FFI based CRT gem for comparison
   gem "aws-sdk-core", "~> 3"
   gem "aws-sdk-dynamodb", "~> 1"
   gem "aws-sdk-s3", "~> 1"
