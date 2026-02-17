@@ -69,7 +69,7 @@ puts "\n--- PutItem ---"
 put_idx_default = 0
 put_idx_crt = 0
 
-Benchmark.ips do |x|
+Benchmark.ips(quiet: true) do |x|
   x.report("Net::HTTP put_item") do
     item = TEST_ITEMS[put_idx_default % TEST_ITEMS.size]
     default_client.put_item(table_name: TABLE, item: item)
@@ -89,7 +89,7 @@ puts "\n--- GetItem ---"
 get_idx_default = 0
 get_idx_crt = 0
 
-Benchmark.ips do |x|
+Benchmark.ips(quiet: true) do |x|
   x.report("Net::HTTP get_item") do
     key = { "id" => (get_idx_default % TEST_ITEMS.size).to_s }
     default_client.get_item(table_name: TABLE, key: key)

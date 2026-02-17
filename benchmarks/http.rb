@@ -63,7 +63,7 @@ net_http_get(uri, PATH_1KB)
 # ---------------------------------------------------------------------------
 
 puts "=== Latency: 1 KB response ==="
-Benchmark.ips do |x|
+Benchmark.ips(quiet: true) do |x|
   x.report("CRT  (1 KB)") do
     crt_pool.request("GET", PATH_1KB, host_header)
   end
@@ -80,7 +80,7 @@ end
 # ---------------------------------------------------------------------------
 
 puts "\n=== Latency: 1 MB response ==="
-Benchmark.ips do |x|
+Benchmark.ips(quiet: true) do |x|
   x.report("CRT  (1 MB)") do
     crt_pool.request("GET", PATH_1MB, host_header)
   end
@@ -97,7 +97,7 @@ end
 # ---------------------------------------------------------------------------
 
 puts "\n=== Throughput: connection pooling (64 B response) ==="
-Benchmark.ips do |x|
+Benchmark.ips(quiet: true) do |x|
   # CRT reuses connections via its built-in pool
   x.report("CRT  (pooled)") do
     crt_pool.request("GET", PATH_THROUGHPUT, host_header)

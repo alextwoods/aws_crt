@@ -62,7 +62,7 @@ SIZES.each_key do |size_label|
   body = BODIES[size_label]
 
   puts "\n--- PutObject #{size_label} ---"
-  Benchmark.ips do |x|
+  Benchmark.ips(quiet: true) do |x|
     x.report("Net::HTTP put_object (#{size_label})") do
       default_client.put_object(bucket: BUCKET, key: key, body: body)
     end
@@ -75,7 +75,7 @@ SIZES.each_key do |size_label|
   end
 
   puts "\n--- GetObject #{size_label} ---"
-  Benchmark.ips do |x|
+  Benchmark.ips(quiet: true) do |x|
     x.report("Net::HTTP get_object (#{size_label})") do
       default_client.get_object(bucket: BUCKET, key: key)
     end

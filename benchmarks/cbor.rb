@@ -52,7 +52,7 @@ end.freeze
 puts "=== CBOR Encode ==="
 PAYLOADS.each do |label, data|
   puts "\n--- #{label} ---"
-  Benchmark.ips do |x|
+  Benchmark.ips(quiet: true) do |x|
     x.report("AwsCrt::Cbor.encode (Rust)") do
       AwsCrt::Cbor.encode(data)
     end
@@ -81,7 +81,7 @@ PAYLOADS.each_key do |label|
   encoded = ENCODED[label]
   json_encoded = JSON_ENCODED[label]
   puts "\n--- #{label} ---"
-  Benchmark.ips do |x|
+  Benchmark.ips(quiet: true) do |x|
     x.report("AwsCrt::Cbor.decode (Rust)") do
       AwsCrt::Cbor.decode(encoded)
     end
