@@ -92,7 +92,7 @@ end
 default_client = Aws::DynamoDB::Client.new
 
 Aws::DynamoDB::Client.add_plugin(AwsCrt::Http::Plugin)
-crt_client = Aws::DynamoDB::Client.new(max_connections: [25, THREADS + 5].min)
+crt_client = Aws::DynamoDB::Client.new(max_connections: [25, THREADS * 1.2].min.to_i)
 
 setup_dynamodb_test_data(default_client)
 

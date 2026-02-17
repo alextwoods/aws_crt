@@ -107,7 +107,7 @@ end
 default_client = Aws::S3::Client.new
 
 Aws::S3::Client.add_plugin(AwsCrt::Http::Plugin)
-crt_client = Aws::S3::Client.new
+crt_client = Aws::S3::Client.new(max_connections: [25, THREADS * 1.2].min.to_i)
 
 default_executor = Concurrent::FixedThreadPool.new(THREADS)
 crt_executor     = Concurrent::FixedThreadPool.new(THREADS)
