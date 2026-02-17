@@ -72,7 +72,8 @@ fn main() {
             println!("cargo:rustc-link-lib=framework=Network");
         }
         "linux" => {
-            // s2n-tls and its libcrypto dependency
+            // s2n-tls and libcrypto (from AWS-LC) are prebuilt into
+            // the same install tree by the CMake build.
             let s2n_lib = lib_dir.join("libs2n.a");
             if !s2n_lib.exists() {
                 panic!(
@@ -81,8 +82,16 @@ fn main() {
                     s2n_lib.display()
                 );
             }
+            let crypto_lib = lib_dir.join("libcrypto.a");
+            if !crypto_lib.exists() {
+                panic!(
+                    "Required CRT library 'crypto' (AWS-LC) not found at {}.\n\
+                     Please rebuild the CRT libraries: rake crt:compile",
+                    crypto_lib.display()
+                );
+            }
             println!("cargo:rustc-link-lib=static=s2n");
-            println!("cargo:rustc-link-lib=dylib=crypto");
+            println!("cargo:rustc-link-lib=static=crypto");
             println!("cargo:rustc-link-lib=dylib=pthread");
             println!("cargo:rustc-link-lib=dylib=dl");
         }
