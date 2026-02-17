@@ -44,7 +44,7 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 │  src/pool.rs              Ruby-facing pool class          │
 │  src/error.rs             CRT → Ruby error translation   │
 └──────────────────────────┬──────────────────────────────┘
-                           │  extern "C" / FFI calls
+                           │  extern "C" / calls
 ┌──────────────────────────▼──────────────────────────────┐
 │  CRT C static libraries                                  │
 │  aws-c-http          HTTP/1.1 protocol + conn manager    │
@@ -245,8 +245,44 @@ bundle exec rake
 ### Run benchmarks
 
 ```sh
-bundle exec rake benchmark          # checksums
-bundle exec rake benchmark:cbor     # CBOR encode/decode
+bundle exec rake benchmark              # checksums + CBOR + HTTP (local)
+bundle exec rake benchmark:cbor         # CBOR encode/decode
+bundle exec rake benchmark:http         # HTTP (local test server)
+bundle exec rake benchmark:http:s3      # S3 get/put (benchmark-ips)
+bundle exec rake benchmark:http:dynamodb            # DynamoDB get/put (benchmark-ips)
+bundle exec rake benchmark:http:s3_concurrent       # S3 concurrent I/O
+bundle exec rake benchmark:http:dynamodb_concurrent # DynamoDB concurrent I/O
+```
+
+#### Service benchmarks (S3 & DynamoDB)
+
+The `benchmark:http:s3` and `benchmark:http:dynamodb` tasks use `benchmark-ips`
+to compare single-threaded request throughput between the default `Net::HTTP`
+handler and the CRT HTTP plugin. All operations run in a single `Benchmark.ips`
+block so that `compare!` produces a meaningful cross-comparison.
+
+| ENV var | Default | Description |
+|---------|---------|-------------|
+| `BENCH_S3_BUCKET` | `test-bucket-alexwoo-2` | S3 bucket for test objects |
+| `BENCH_DYNAMODB_TABLE` | *(see source)* | DynamoDB table (partition key `id`, String) |
+
+#### Concurrent I/O benchmarks
+
+The `_concurrent` variants use `concurrent-ruby` with a fixed thread pool to
+measure throughput under parallel load — closer to real-world SDK usage than
+single-threaded `benchmark-ips`.
+
+| ENV var | Default | Description |
+|---------|---------|-------------|
+| `BENCH_TOTAL_CALLS` | `1000` | Total number of API calls to make |
+| `BENCH_THREADS` | `8` | Thread pool size |
+| `BENCH_S3_BUCKET` | `test-bucket-alexwoo-2` | S3 bucket for test objects |
+| `BENCH_DYNAMODB_TABLE` | *(see source)* | DynamoDB table (partition key `id`, String) |
+
+Example with custom concurrency settings:
+
+```sh
+BENCH_THREADS=16 BENCH_TOTAL_CALLS=5000 bundle exec rake benchmark:http:s3_concurrent
 ```
 
 ### Build the CRT libraries only

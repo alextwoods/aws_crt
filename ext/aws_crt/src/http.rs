@@ -245,17 +245,30 @@ unsafe extern "C" fn on_response_headers(
         guard.status_code = status;
     }
 
-    // Collect headers
+    // Collect headers and look for Content-Length to pre-allocate body buffer
     let headers = std::slice::from_raw_parts(header_array, num_headers);
     for h in headers {
-        let name = std::str::from_utf8_unchecked(
-            std::slice::from_raw_parts(h.name.ptr, h.name.len),
-        )
-        .to_string();
-        let value = std::str::from_utf8_unchecked(
-            std::slice::from_raw_parts(h.value.ptr, h.value.len),
-        )
-        .to_string();
+        let name_bytes =
+            std::slice::from_raw_parts(h.name.ptr, h.name.len);
+        let value_bytes =
+            std::slice::from_raw_parts(h.value.ptr, h.value.len);
+
+        // Pre-allocate body buffer from Content-Length (buffered mode only).
+        // This avoids repeated Vec reallocations during on_response_body.
+        if !guard.streaming && h.name.len == 14 {
+            if name_bytes.eq_ignore_ascii_case(b"content-length") {
+                if let Ok(s) = std::str::from_utf8(value_bytes) {
+                    if let Ok(len) = s.parse::<usize>() {
+                        guard.body.reserve(len);
+                    }
+                }
+            }
+        }
+
+        let name =
+            std::str::from_utf8_unchecked(name_bytes).to_string();
+        let value =
+            std::str::from_utf8_unchecked(value_bytes).to_string();
         guard.headers.push((name, value));
     }
 
@@ -470,7 +483,10 @@ pub struct RequestOptions<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub headers: &'a [(String, String)],
-    pub body: Option<&'a [u8]>,
+    /// Owned body bytes. Passed by value to avoid a redundant copy —
+    /// the Vec is moved directly into the `RequestContext` where it
+    /// must remain alive for the CRT input stream's cursor.
+    pub body: Option<Vec<u8>>,
     pub streaming: bool,
     /// Read timeout in milliseconds. If non-zero, the CRT will fail the
     /// request with `AWS_ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT` if the
@@ -483,11 +499,11 @@ pub struct RequestOptions<'a> {
 /// execution. Returns the `RequestContext` (heap-allocated, caller must
 /// eventually `Box::from_raw` it) and a clone of the shared state.
 ///
-/// The body bytes (if any) are copied into a Rust-owned `Vec<u8>` inside
-/// the `RequestContext`. The CRT input stream's cursor points into this
-/// owned Vec, ensuring the data remains valid after the GVL is released.
+/// Body bytes are moved (not copied) into the `RequestContext`. The CRT
+/// input stream's cursor points into this owned Vec, ensuring the data
+/// remains valid after the GVL is released.
 fn build_request(
-    opts: &RequestOptions,
+    opts: RequestOptions,
 ) -> Result<(*mut RequestContext, SharedState), CrtError> {
     let allocator = unsafe { aws_default_allocator() };
 
@@ -528,15 +544,14 @@ fn build_request(
         }
     }
 
-    // Copy body bytes into owned storage and create the input stream.
+    // Move body bytes into owned storage and create the input stream.
     //
     // IMPORTANT: aws_input_stream_new_from_cursor does NOT copy the data —
     // it stores the pointer from the cursor. We must keep `body_data` alive
     // (and un-reallocated) for the entire request lifetime. The Vec is
     // stored in RequestContext and outlives the input stream.
-    let (body_stream, body_data) = if let Some(bytes) = opts.body {
-        if !bytes.is_empty() {
-            let owned: Vec<u8> = bytes.to_vec();
+    let (body_stream, body_data) = if let Some(owned) = opts.body {
+        if !owned.is_empty() {
             let cursor = AwsByteCursor::from_slice(&owned);
             let stream = unsafe {
                 aws_input_stream_new_from_cursor(allocator, &cursor)
@@ -624,7 +639,7 @@ pub fn make_request(
     method: &str,
     path: &str,
     headers: &[(String, String)],
-    body: Option<&[u8]>,
+    body: Option<Vec<u8>>,
     read_timeout_ms: u64,
 ) -> Result<HttpResponse, CrtError> {
     let opts = RequestOptions {
@@ -637,7 +652,7 @@ pub fn make_request(
         read_timeout_ms,
     };
 
-    let (ctx_ptr, state) = build_request(&opts)?;
+    let (ctx_ptr, state) = build_request(opts)?;
 
     // Acquire a connection — this is async, the callback fires the request
     unsafe {
@@ -664,16 +679,19 @@ pub fn make_request(
     // Clean up the request context
     unsafe { cleanup_request_context(ctx_ptr) };
 
-    // Extract the result
-    let guard = state.0.lock().unwrap();
+    // Extract the result — move data out of the mutex instead of cloning.
+    // At this point the CRT callbacks are done and we hold the only
+    // remaining Arc reference, so taking ownership avoids an extra
+    // allocation + copy of the headers Vec and body Vec.
+    let mut guard = state.0.lock().unwrap();
     if guard.error_code != 0 {
         return Err(CrtError::from_code(guard.error_code));
     }
 
     Ok(HttpResponse {
         status_code: guard.status_code,
-        headers: guard.headers.clone(),
-        body: guard.body.clone(),
+        headers: std::mem::take(&mut guard.headers),
+        body: std::mem::take(&mut guard.body),
     })
 }
 
@@ -722,7 +740,7 @@ pub fn make_streaming_request<H, F>(
     method: &str,
     path: &str,
     headers: &[(String, String)],
-    body: Option<&[u8]>,
+    body: Option<Vec<u8>>,
     read_timeout_ms: u64,
     mut on_headers: H,
     mut on_chunk: F,
@@ -741,7 +759,7 @@ where
         read_timeout_ms,
     };
 
-    let (ctx_ptr, state) = build_request(&opts)?;
+    let (ctx_ptr, state) = build_request(opts)?;
 
     // Acquire a connection
     unsafe {

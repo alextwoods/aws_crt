@@ -82,6 +82,21 @@ namespace :benchmark do
     task dynamodb: :compile do
       ruby "benchmarks/http_dynamodb.rb"
     end
+
+    desc "Run S3 concurrent I/O benchmarks (Net::HTTP vs CRT plugin)"
+    task s3_concurrent: :compile do
+      ruby "benchmarks/http_s3_concurrent.rb"
+    end
+
+    desc "Run DynamoDB concurrent I/O benchmarks (Net::HTTP vs CRT plugin)"
+    task dynamodb_concurrent: :compile do
+      ruby "benchmarks/http_dynamodb_concurrent.rb"
+    end
+
+    desc "Run S3 TransferManager concurrent benchmarks (Net::HTTP vs CRT plugin)"
+    task s3_tm_concurrent: :compile do
+      ruby "benchmarks/http_s3_tm_concurrent.rb"
+    end
   end
 end
 

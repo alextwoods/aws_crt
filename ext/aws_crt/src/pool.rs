@@ -6,9 +6,11 @@
 use std::cell::RefCell;
 
 use magnus::prelude::*;
+use magnus::rb_sys::AsRawValue;
 use magnus::scan_args::scan_args;
 use magnus::typed_data;
 use magnus::{method, Error, RArray, RHash, RString, Ruby, Symbol, Value};
+use rb_sys::VALUE;
 
 use crate::connection_manager::{ConnectionManager, ConnectionManagerOptions};
 use crate::http;
@@ -199,16 +201,39 @@ impl ConnectionPool {
         let read_timeout_ms = *rb_self.read_timeout_ms.borrow();
 
         // Convert Ruby headers array [[name, value], ...] to Vec<(String, String)>
-        let mut header_vec: Vec<(String, String)> = Vec::new();
+        // Uses raw rb_sys APIs to avoid per-element magnus type-checking
+        // overhead (same pattern as cbor.rs for hot-path array access).
         let header_len = headers.len();
-        for i in 0..header_len {
-            let pair: RArray = headers.entry(i as isize)?;
-            let name: String = pair.entry(0)?;
-            let value: String = pair.entry(1)?;
-            header_vec.push((name, value));
+        let mut header_vec: Vec<(String, String)> = Vec::with_capacity(header_len);
+        unsafe {
+            let arr_ptr = rb_sys::RARRAY_CONST_PTR(headers.as_raw());
+            for i in 0..header_len {
+                let pair_val: VALUE = *arr_ptr.add(i);
+                let pair_ptr = rb_sys::RARRAY_CONST_PTR(pair_val);
+                let name_val: VALUE = *pair_ptr;
+                let value_val: VALUE = *pair_ptr.add(1);
+
+                let name_ptr = rb_sys::RSTRING_PTR(name_val) as *const u8;
+                let name_len = rb_sys::RSTRING_LEN(name_val) as usize;
+                let name = std::str::from_utf8_unchecked(
+                    std::slice::from_raw_parts(name_ptr, name_len),
+                )
+                .to_string();
+
+                let value_ptr = rb_sys::RSTRING_PTR(value_val) as *const u8;
+                let value_len = rb_sys::RSTRING_LEN(value_val) as usize;
+                let value = std::str::from_utf8_unchecked(
+                    std::slice::from_raw_parts(value_ptr, value_len),
+                )
+                .to_string();
+
+                header_vec.push((name, value));
+            }
         }
 
-        // Get body bytes (copy into Rust before releasing GVL)
+        // Get body bytes (copy into Rust before releasing GVL).
+        // This owned Vec is moved directly into the request context,
+        // avoiding a second copy inside build_request.
         let body_bytes: Option<Vec<u8>> = match body {
             Some(s) if !s.is_nil() => {
                 let slice = unsafe { s.as_slice() };
@@ -216,7 +241,6 @@ impl ConnectionPool {
             }
             _ => None,
         };
-        let body_ref = body_bytes.as_deref();
 
         // Check if a block was given
         let block = ruby.block_given();
@@ -235,7 +259,7 @@ impl ConnectionPool {
                 &method,
                 &path,
                 &header_vec,
-                body_ref,
+                body_bytes,
                 read_timeout_ms,
                 |status, hdrs| {
                     captured_status = status;
@@ -263,7 +287,7 @@ impl ConnectionPool {
                 &method,
                 &path,
                 &header_vec,
-                body_ref,
+                body_bytes,
                 read_timeout_ms,
             )
             .map_err(|e| -> Error { e.into() })?;
