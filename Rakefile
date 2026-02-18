@@ -52,6 +52,7 @@ task install: :build do
   abort "Gem not found in pkg/ — did `rake build` succeed?" unless built_gem
 
   Bundler.with_unbundled_env do
+    sh "gem uninstall #{GEMSPEC.name} --version #{GEMSPEC.version} --force --executables 2>/dev/null; true"
     sh "gem install #{built_gem}"
   end
 end
@@ -70,6 +71,11 @@ namespace :benchmark do
   desc "Run HTTP benchmarks (CRT vs Net::HTTP, local server)"
   task http: :compile do
     ruby "benchmarks/http.rb"
+  end
+
+    desc "Run S3 benchmarks (CRT vs Aws::S3 Client/TransferManager, real service requests)"
+  task s3: :compile do
+    ruby "benchmarks/s3.rb"
   end
 
   namespace :http do
