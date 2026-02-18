@@ -16,6 +16,11 @@ Metrics/BlockLength:
     - "benchmarks/**/*"
     - "Rakefile"
 
+# Rantly's property_of { ... }.check(N) API requires chaining blocks.
+Style/MultilineBlockChain:
+  Exclude:
+    - "spec/**/properties/**/*"
+
 Metrics/MethodLength:
   Exclude:
     - "ext/**/*"

@@ -8,6 +8,7 @@ This gem provides:
 - **CRC Checksums** — Hardware-accelerated CRC32, CRC32C, and CRC64-NVME via the CRT (SSE4.2, AVX-512, CLMUL, ARM CRC, ARM PMULL) with efficient software fallbacks.
 - **CBOR Encoder/Decoder** — A fast CBOR (RFC 8949) encoder and decoder implemented in Rust, compatible with the `Aws::Cbor` interface from `aws-sdk-core`.
 - **HTTP Client** — A CRT-backed HTTP/1.1 client with connection pooling, TLS, proxy support, and streaming responses. Drop-in replacement for the default `Net::HTTP` handler in the AWS SDK for Ruby V3.
+- **S3 Client** — A standalone high-performance S3 client backed by the CRT's `aws-c-s3` meta-request system. Provides automatic request splitting (parallel multipart upload/download), per-chunk retries, and parallel file I/O for significantly higher throughput on large object transfers.
 
 The native extension is written in Rust (using [magnus](https://github.com/matsadler/magnus)
 and [rb_sys](https://github.com/oxidize-rb/rb-sys)) and calls directly into
@@ -21,6 +22,7 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 │  AwsCrt::Checksums.crc32(data)                          │
 │  AwsCrt::Cbor.encode(data)                              │
 │  Aws::S3::Client.new  (with CRT HTTP handler)           │
+│  AwsCrt::S3::Client.new  (standalone CRT S3 client)     │
 └──────────────────────────┬──────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────┐
@@ -30,6 +32,9 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 │  lib/aws_crt/http/patcher.rb     auto-patch on require   │
 │  lib/aws_crt/http/connection_pool_manager.rb             │
 │  lib/aws_crt/http/connection_pool.rb                     │
+│  lib/aws_crt/s3/client.rb        S3 client wrapper       │
+│  lib/aws_crt/s3/response.rb      S3 response object      │
+│  lib/aws_crt/s3/errors.rb        S3 error hierarchy      │
 └──────────────────────────┬──────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────┐
@@ -38,6 +43,11 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 │  src/cbor.rs              CBOR encode/decode             │
 │  src/http.rs              request/response execution     │
 │  src/connection_manager.rs  CRT connection pool wrapper  │
+│  src/s3_client.rs         CRT S3 client wrapper          │
+│  src/s3_request.rs        S3 meta-request execution      │
+│  src/s3_ruby.rs           Ruby-facing S3 class           │
+│  src/credentials.rs       CRT credentials bridge         │
+│  src/signing.rs           CRT signing config             │
 │  src/runtime.rs           shared CRT resources (once)    │
 │  src/tls.rs               TLS context management         │
 │  src/proxy.rs             proxy configuration            │
@@ -47,6 +57,9 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
                            │  extern "C" / calls
 ┌──────────────────────────▼──────────────────────────────┐
 │  CRT C static libraries                                  │
+│  aws-c-s3            S3 meta-requests + parallel I/O     │
+│  aws-c-auth          credentials + SigV4 signing         │
+│  aws-c-sdkutils      SDK utility functions               │
 │  aws-c-http          HTTP/1.1 protocol + conn manager    │
 │  aws-c-compression   HTTP content encoding               │
 │  aws-c-io            event loops, TLS, sockets, DNS      │
@@ -60,7 +73,7 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 ## CRT Libraries
 
 The CRT libraries are included as git submodules under `crt/`. The full
-dependency graph for HTTP support is:
+dependency graph for HTTP and S3 support is:
 
 ```
 crt/
@@ -71,6 +84,9 @@ crt/
 ├── aws-c-io/               # Event loops, sockets, TLS, DNS resolver
 ├── aws-c-compression/      # HTTP content encoding (huffman, etc.)
 ├── aws-c-http/             # HTTP/1.1 protocol and connection manager
+├── aws-c-sdkutils/         # SDK utility functions
+├── aws-c-auth/             # Credentials and SigV4 signing
+├── aws-c-s3/               # S3 meta-requests, parallel I/O, request splitting
 └── s2n-tls/                # TLS provider (Linux only; macOS uses Security.framework)
 ```
 
@@ -83,6 +99,9 @@ aws-c-common
 │   └── aws-c-io  (+ s2n-tls on Linux)
 │       ├── aws-c-compression
 │       └── aws-c-http
+├── aws-c-sdkutils
+├── aws-c-auth  (depends on aws-c-sdkutils, aws-c-cal, aws-c-http)
+└── aws-c-s3    (depends on aws-c-auth, aws-checksums)
 ```
 
 ### How they're built
@@ -93,24 +112,27 @@ The build is driven by cmake and orchestrated through Rake:
    static archives (`.a` files) into `crt/install/`. The cmake project
    (`crt/CMakeLists.txt`) adds libraries in dependency order: `aws-c-common`
    first, then `aws-checksums`, `aws-c-cal`, `s2n-tls` (Linux only),
-   `aws-c-io`, `aws-c-compression`, and `aws-c-http`. Shared libraries and
-   tests are disabled — only the static libraries and headers are installed.
+   `aws-c-io`, `aws-c-compression`, `aws-c-http`, `aws-c-sdkutils`,
+   `aws-c-auth`, and `aws-c-s3`. Shared libraries and tests are disabled —
+   only the static libraries and headers are installed.
 
 2. `rake compile` depends on `crt:compile`, so the CRT libraries are always
    built before the Rust extension. The Rust `build.rs` script locates the
    pre-built static libraries under `crt/install/lib/` and tells Cargo to
    link them into the final `.bundle`/`.so` in the correct dependency order
-   (dependents first: `aws-c-http` → `aws-c-compression` → `aws-c-io` →
-   `aws-c-cal` → `aws-checksums` → `aws-c-common`). On Linux, `s2n-tls`
-   and `libcrypto` are also linked. On macOS, Security.framework and
-   CoreFoundation.framework are linked for TLS and platform services.
+   (dependents first: `aws-c-s3` → `aws-c-auth` → `aws-c-sdkutils` →
+   `aws-c-http` → `aws-c-compression` → `aws-c-io` → `aws-c-cal` →
+   `aws-checksums` → `aws-c-common`). On Linux, `s2n-tls` and `libcrypto`
+   are also linked. On macOS, Security.framework and CoreFoundation.framework
+   are linked for TLS and platform services.
 
 3. The Rust extension (`ext/aws_crt/`) uses `rb_sys` and `magnus` to bridge
    between Ruby and Rust. The Rust code declares `extern "C"` bindings to
-   CRT checksum functions (in `src/lib.rs`) and CRT HTTP APIs (in
-   `src/http.rs`, `src/connection_manager.rs`, `src/runtime.rs`, `src/tls.rs`,
-   `src/proxy.rs`). The HTTP path releases the GVL during blocking I/O so
-   other Ruby threads can run concurrently.
+   CRT checksum functions (in `src/lib.rs`), CRT HTTP APIs (in `src/http.rs`,
+   `src/connection_manager.rs`, `src/runtime.rs`, `src/tls.rs`, `src/proxy.rs`),
+   and CRT S3 APIs (in `src/s3_client.rs`, `src/s3_request.rs`,
+   `src/credentials.rs`, `src/signing.rs`). Both the HTTP and S3 paths release
+   the GVL during blocking I/O so other Ruby threads can run concurrently.
 
 ### How they're included in the gem
 
@@ -252,6 +274,7 @@ bundle exec rake benchmark:http:s3      # S3 get/put (benchmark-ips)
 bundle exec rake benchmark:http:dynamodb            # DynamoDB get/put (benchmark-ips)
 bundle exec rake benchmark:http:s3_concurrent       # S3 concurrent I/O
 bundle exec rake benchmark:http:dynamodb_concurrent # DynamoDB concurrent I/O
+bundle exec ruby benchmarks/s3.rb       # CRT S3 client vs SDK (benchmark-ips)
 ```
 
 #### Service benchmarks (S3 & DynamoDB)
@@ -283,6 +306,22 @@ Example with custom concurrency settings:
 
 ```sh
 BENCH_THREADS=16 BENCH_TOTAL_CALLS=5000 bundle exec rake benchmark:http:s3_concurrent
+```
+
+#### CRT S3 client benchmarks
+
+The `benchmarks/s3.rb` script compares the standalone CRT S3 client
+(`AwsCrt::S3::Client`) against the standard `Aws::S3::Client` for upload and
+download throughput. It tests both in-memory and file I/O paths at 1MB and
+100MB object sizes.
+
+| ENV var | Default | Description |
+|---------|---------|-------------|
+| `BENCH_S3_BUCKET` | `crt-s3-benchmark` | S3 bucket for test objects |
+| `BENCH_S3_REGION` | `us-east-1` | AWS region |
+
+```sh
+BENCH_S3_BUCKET=my-bucket BENCH_S3_REGION=us-west-2 bundle exec ruby benchmarks/s3.rb
 ```
 
 ### Build the CRT libraries only
@@ -464,6 +503,208 @@ HTTP errors inherit from `AwsCrt::Http::Error`:
 - `TimeoutError` — connect or read timeout exceeded
 - `TlsError` — TLS handshake or certificate failures
 - `ProxyError` — proxy connection or authentication failures
+
+### S3 Client
+
+The CRT S3 client is a standalone high-performance client at `AwsCrt::S3::Client`.
+Unlike the HTTP client (which is a drop-in Seahorse handler), the S3 client
+wraps the CRT's meta-request system directly — giving you automatic request
+splitting, per-chunk retries, and parallel file I/O out of the box.
+
+#### Creating a client
+
+```ruby
+require "aws_crt/s3"
+
+# With an AWS SDK credential provider (recommended)
+provider = Aws::SharedCredentials.new
+client = AwsCrt::S3::Client.new(
+  region: "us-east-1",
+  credentials: provider
+)
+
+# With a credentials object
+creds = AwsCrt::S3::Credentials.new(
+  access_key_id: "AKIA...",
+  secret_access_key: "secret",
+  session_token: "token"  # optional
+)
+client = AwsCrt::S3::Client.new(
+  region: "us-east-1",
+  credentials: creds
+)
+
+# With raw strings (backward compatible)
+client = AwsCrt::S3::Client.new(
+  region: "us-east-1",
+  access_key_id: "AKIA...",
+  secret_access_key: "secret"
+)
+```
+
+The `:credentials` parameter accepts either:
+- A credential provider (any object with a `credentials` method that returns a credentials object). This is the recommended approach — credentials are resolved fresh on every request, so temporary credentials from STS AssumeRole or SSO are automatically refreshed.
+- A credentials object (any object with `access_key_id`, `secret_access_key`, and `session_token` methods).
+
+Any `Aws::CredentialProvider` from the AWS SDK for Ruby works out of the box (`Aws::SharedCredentials`, `Aws::AssumeRoleCredentials`, `Aws::InstanceProfileCredentials`, etc.).
+
+#### Configuration options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `region` | *(required)* | AWS region |
+| `credentials` | *(required)* | Credential provider or credentials object (see above) |
+| `throughput_target_gbps` | 10.0 | Target aggregate throughput; CRT auto-tunes parallelism to match |
+| `part_size` | nil | Chunk size in bytes for parallel transfers (auto-tuned by CRT if nil) |
+| `multipart_upload_threshold` | nil | Minimum body size before CRT uses multipart upload |
+| `memory_limit_in_bytes` | nil | Cap on memory used for buffering transfer data |
+| `max_active_connections_override` | nil | Cap on concurrent connections to S3 |
+
+#### Downloading objects
+
+```ruby
+# Buffered — entire body returned in memory
+resp = client.get_object(bucket: "my-bucket", key: "my-key")
+puts resp.status_code  # => 200
+puts resp.body         # => "file contents..."
+
+# Download to file path — CRT writes directly to disk (fastest path)
+resp = client.get_object(bucket: "my-bucket", key: "large-file.bin",
+                         response_target: "/tmp/large-file.bin")
+# resp.body is nil; data went straight to the file
+
+# Download to File object — also uses CRT direct file I/O
+File.open("/tmp/large-file.bin", "wb") do |f|
+  resp = client.get_object(bucket: "my-bucket", key: "large-file.bin",
+                           response_target: f)
+end
+# File objects are automatically converted to their path, so this is
+# just as fast as passing the path string directly.
+
+# Stream to an IO object
+io = StringIO.new
+resp = client.get_object(bucket: "my-bucket", key: "my-key",
+                         response_target: io)
+io.rewind
+puts io.read
+
+# Block streaming — process chunks as they arrive
+client.get_object(bucket: "my-bucket", key: "my-key") do |chunk|
+  # process each chunk
+end
+```
+
+#### Uploading objects
+
+```ruby
+# String body
+client.put_object(bucket: "my-bucket", key: "my-key", body: "hello world")
+
+# File body — CRT reads directly from disk (fastest path)
+File.open("large-file.bin", "rb") do |f|
+  client.put_object(bucket: "my-bucket", key: "large-file.bin", body: f)
+end
+
+# IO body (e.g. StringIO)
+io = StringIO.new("data from IO")
+client.put_object(bucket: "my-bucket", key: "my-key", body: io)
+
+# With explicit content type and length
+client.put_object(
+  bucket: "my-bucket",
+  key: "my-key",
+  body: "hello",
+  content_type: "text/plain",
+  content_length: 5
+)
+```
+
+#### Checksum support
+
+```ruby
+# Compute and attach a checksum on upload
+client.put_object(
+  bucket: "my-bucket",
+  key: "my-key",
+  body: "hello",
+  checksum_algorithm: "CRC32"  # CRC32, CRC32C, SHA1, or SHA256
+)
+
+# Validate checksum on download
+resp = client.get_object(
+  bucket: "my-bucket",
+  key: "my-key",
+  checksum_mode: "ENABLED"
+)
+puts resp.checksum_validated  # => "CRC32" (or nil if no checksum was present)
+```
+
+#### Progress reporting
+
+```ruby
+on_progress = ->(bytes_transferred) { puts "#{bytes_transferred} bytes" }
+
+client.get_object(bucket: "my-bucket", key: "large.bin",
+                  response_target: "/tmp/large.bin",
+                  on_progress: on_progress)
+
+client.put_object(bucket: "my-bucket", key: "large.bin",
+                  body: File.open("large.bin", "rb"),
+                  on_progress: on_progress)
+```
+
+#### Response object
+
+Both `get_object` and `put_object` return an `AwsCrt::S3::Response`:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `status_code` | Integer | HTTP status code |
+| `headers` | Hash | Response headers (String keys and values) |
+| `body` | String or nil | Response body (nil when streamed to a target) |
+| `checksum_validated` | String or nil | Checksum algorithm validated by the CRT |
+| `successful?` | Boolean | True if status code is 2xx |
+
+#### Error handling
+
+```ruby
+begin
+  client.get_object(bucket: "my-bucket", key: "nonexistent")
+rescue AwsCrt::S3::ServiceError => e
+  # HTTP error from S3 (4xx/5xx)
+  puts e.message      # => "S3 service error: HTTP 404"
+  puts e.status_code   # => 404
+  puts e.headers       # => { "x-amz-request-id" => "..." }
+  puts e.error_body    # => "<Error><Code>NoSuchKey</Code>..."
+rescue AwsCrt::S3::NetworkError => e
+  # Connection/transport failure
+  puts e.message
+rescue AwsCrt::S3::Error => e
+  # Catch-all for any S3 error
+  puts e.message
+end
+```
+
+Error hierarchy:
+
+```
+AwsCrt::Error
+  └── AwsCrt::S3::Error
+        ├── AwsCrt::S3::ServiceError   (HTTP 4xx/5xx from S3)
+        └── AwsCrt::S3::NetworkError   (connection/transport failures)
+```
+
+#### CRT S3 client vs HTTP client plugin
+
+The gem offers two ways to talk to S3:
+
+| | CRT S3 Client (`AwsCrt::S3::Client`) | CRT HTTP Plugin (`AwsCrt::Http::Plugin`) |
+|---|---|---|
+| Interface | Standalone client with `get_object`/`put_object` | Drop-in replacement for `Net::HTTP` in the SDK |
+| Request splitting | Automatic parallel multipart | None (single HTTP request) |
+| Per-chunk retries | Yes | No (full-request retry only) |
+| File I/O | Direct CRT file I/O (bypasses Ruby) | Streams through Ruby |
+| Best for | Large object transfers (multi-MB+) | General AWS API calls, small S3 operations |
 
 ## License
 

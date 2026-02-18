@@ -39,8 +39,12 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
 
     // Link the CRT static libraries (order matters: dependents first)
-    // HTTP stack
+    // S3 stack
     let required_libs = [
+        "aws-c-s3",
+        "aws-c-auth",
+        "aws-c-sdkutils",
+        // HTTP stack
         "aws-c-http",
         "aws-c-compression",
         "aws-c-io",

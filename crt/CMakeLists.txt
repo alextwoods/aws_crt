@@ -21,6 +21,9 @@ set(BUILD_TESTING OFF)
 #   │   └── aws-c-io  (+ s2n-tls on Linux)
 #   │       ├── aws-c-compression
 #   │       └── aws-c-http
+#   ├── aws-c-sdkutils
+#   ├── aws-c-auth
+#   └── aws-c-s3
 
 # Foundation
 add_subdirectory(aws-c-common)
@@ -73,3 +76,8 @@ add_subdirectory(aws-c-io)
 # HTTP stack
 add_subdirectory(aws-c-compression)
 add_subdirectory(aws-c-http)
+
+# S3 dependency chain
+add_subdirectory(aws-c-sdkutils)
+add_subdirectory(aws-c-auth)
+add_subdirectory(aws-c-s3)

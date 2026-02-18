@@ -4,11 +4,16 @@ use magnus::{
 
 mod cbor;
 pub mod connection_manager;
+pub mod credentials;
 pub mod error;
 pub mod http;
 pub mod pool;
 pub mod proxy;
 pub mod runtime;
+pub mod s3_client;
+pub mod s3_request;
+pub mod s3_ruby;
+pub mod signing;
 pub mod tls;
 
 // FFI bindings to the AWS CRT checksum C functions.
@@ -131,6 +136,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let http = module.define_module("Http")?;
     error::define_http_errors(ruby, &http)?;
     pool::define_connection_pool(ruby, &http)?;
+
+    // S3 module
+    let s3 = module.define_module("S3")?;
+    s3_ruby::define_s3_client(ruby, &s3)?;
 
     Ok(())
 }
