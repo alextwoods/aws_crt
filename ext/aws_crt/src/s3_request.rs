@@ -328,7 +328,7 @@ extern "C" {
     ) -> *mut std::ffi::c_void;
 
     // Checksum algorithm name lookup
-    fn aws_s3_checksum_algorithm_to_string(
+    fn aws_get_checksum_algorithm_name(
         algorithm: i32,
     ) -> AwsByteCursor;
 }
@@ -495,7 +495,7 @@ unsafe extern "C" fn finish_callback(
 
     // Record checksum validation status
     if r.did_validate && r.validation_algorithm != AWS_SCA_NONE {
-        let algo_cursor = aws_s3_checksum_algorithm_to_string(r.validation_algorithm);
+        let algo_cursor = aws_get_checksum_algorithm_name(r.validation_algorithm);
         if !algo_cursor.ptr.is_null() && algo_cursor.len > 0 {
             let algo_bytes =
                 std::slice::from_raw_parts(algo_cursor.ptr, algo_cursor.len);
