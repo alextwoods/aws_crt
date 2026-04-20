@@ -226,7 +226,8 @@ git clone --recurse-submodules https://github.com/awslabs/aws_crt.git
 cd aws_crt
 bundle install
 ```
-(Note, if you get errors you may need to do `rake clobber build install`)
+(Note, if you get errors you may need to do `
+`)
 
 If you already cloned without `--recurse-submodules`:
 

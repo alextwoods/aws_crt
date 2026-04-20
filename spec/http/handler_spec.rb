@@ -8,7 +8,6 @@
 #   8.3 — Populates http_response with status_code, headers, body from CRT response
 #   8.4 — Streams response body via signal_data when response_target is set
 #   8.6 — Wraps CRT errors in Seahorse::Client::NetworkingError
-#  12.1 — Unit tests for Handler
 
 require "socket"
 require "json"
@@ -16,8 +15,7 @@ require "uri"
 require "stringio"
 require "logger"
 
-# Minimal Seahorse stubs — just enough for Handler to load and run.
-# Matches the pattern established in spec/http/properties/logging_spec.rb.
+# Minimal Seahorse stubs
 module Seahorse
   module Client
     class Handler
@@ -49,8 +47,7 @@ end
 
 require_relative "../../lib/aws_crt/http/handler"
 
-# JSON echo server that reflects the request back as a structured response.
-# Returns method, path, headers, and body so tests can verify the translation.
+# JSON echo server
 module HandlerEchoServer
   def self.start
     server = TCPServer.new("127.0.0.1", 0)
@@ -64,7 +61,7 @@ module HandlerEchoServer
       client = server.accept
       handle(client)
     rescue IOError, Errno::EPIPE, Errno::ECONNRESET
-      # Client disconnected — continue accepting
+      # Client disconnected
     end
   end
 
@@ -105,8 +102,7 @@ module HandlerEchoServer
   end
 end
 
-# Lightweight Seahorse stand-ins. Only the methods actually called by
-# Handler are implemented.
+# Lightweight Seahorse stand-ins
 module HandlerStubs
   Headers = Struct.new(:pairs) do
     def each_pair(&block)
@@ -148,7 +144,7 @@ module HandlerStubs
     end
   end
 
-  Config = Struct.new(:crt_pool_manager, :logger, keyword_init: true)
+  Config = Struct.new(:crt_http_client, :logger, keyword_init: true)
 
   class Context
     attr_accessor :http_request, :http_response, :config, :metadata
@@ -176,8 +172,8 @@ RSpec.describe AwsCrt::Http::Handler do
     server&.close
   end
 
-  def make_pool_manager
-    AwsCrt::Http::ConnectionPoolManager.new({})
+  def make_client
+    AwsCrt::Http::Client.new
   end
 
   def build_context(method:, path:, headers: [], body: nil, streaming: false, logger: nil)
@@ -189,7 +185,7 @@ RSpec.describe AwsCrt::Http::Handler do
     request = HandlerStubs::Request.new(uri, method, stub_headers, body)
     response = HandlerStubs::Response.new
     config = HandlerStubs::Config.new(
-      crt_pool_manager: make_pool_manager,
+      crt_http_client: make_client,
       logger: logger
     )
     metadata = streaming ? { response_target: proc {} } : {}
@@ -252,7 +248,6 @@ RSpec.describe AwsCrt::Http::Handler do
 
       echo = JSON.parse(context.http_response.body_string)
       expect(echo["body"]).to eq("io body content")
-      # Handler should rewind the body after reading
       expect(body_io.pos).to eq(0)
     end
   end
@@ -284,15 +279,12 @@ RSpec.describe AwsCrt::Http::Handler do
     it "wraps AwsCrt::Http::Error in NetworkingError via signal_error" do
       context = build_context(method: "GET", path: "/will-fail")
 
-      # Use a fake pool that raises a generic AwsCrt::Http::Error
-      fake_pool = Object.new
-      def fake_pool.request(*)
+      # Use a fake client that raises
+      fake_client = Object.new
+      def fake_client.request(*)
         raise AwsCrt::Http::Error, "CRT request failed"
       end
-
-      fake_manager = Object.new
-      fake_manager.define_singleton_method(:pool_for) { |_| fake_pool }
-      context.config.crt_pool_manager = fake_manager
+      context.config.crt_http_client = fake_client
 
       handler = described_class.new
       result = handler.call(context)
@@ -301,24 +293,17 @@ RSpec.describe AwsCrt::Http::Handler do
       expect(resp.error).to be_a(Seahorse::Client::NetworkingError)
       expect(resp.error.original_error).to be_a(AwsCrt::Http::Error)
       expect(resp.error.message).to eq("CRT request failed")
-      # Should still return a Seahorse::Client::Response
       expect(result).to be_a(Seahorse::Client::Response)
     end
 
     it "wraps TimeoutError as NetworkingError" do
       context = build_context(method: "GET", path: "/timeout-test")
 
-      # Simulate a TimeoutError by using a pool that raises one.
-      # We create a real pool manager but intercept pool_for to return
-      # a pool whose request method raises TimeoutError.
-      fake_pool = Object.new
-      def fake_pool.request(*)
+      fake_client = Object.new
+      def fake_client.request(*)
         raise AwsCrt::Http::TimeoutError, "read timeout"
       end
-
-      fake_manager = Object.new
-      fake_manager.define_singleton_method(:pool_for) { |_| fake_pool }
-      context.config.crt_pool_manager = fake_manager
+      context.config.crt_http_client = fake_client
 
       handler = described_class.new
       handler.call(context)
@@ -330,14 +315,11 @@ RSpec.describe AwsCrt::Http::Handler do
     it "wraps ConnectionError as NetworkingError" do
       context = build_context(method: "GET", path: "/conn-error")
 
-      fake_pool = Object.new
-      def fake_pool.request(*)
+      fake_client = Object.new
+      def fake_client.request(*)
         raise AwsCrt::Http::ConnectionError, "connection refused"
       end
-
-      fake_manager = Object.new
-      fake_manager.define_singleton_method(:pool_for) { |_| fake_pool }
-      context.config.crt_pool_manager = fake_manager
+      context.config.crt_http_client = fake_client
 
       handler = described_class.new
       handler.call(context)
@@ -365,9 +347,7 @@ RSpec.describe AwsCrt::Http::Handler do
       expect(resp.error).to be_nil, "unexpected error: #{resp.error.inspect}"
       expect(resp.status_code).to eq(200)
       expect(resp.done).to be true
-      # In streaming mode, body arrives as one or more chunks via signal_data
       expect(resp.body_chunks).not_to be_empty
-      # The concatenated chunks should form valid JSON (the echo response)
       echo = JSON.parse(resp.body_string)
       expect(echo["method"]).to eq("POST")
       expect(echo["path"]).to eq("/stream-me")
@@ -392,7 +372,6 @@ RSpec.describe AwsCrt::Http::Handler do
       expect(resp.error).to be_nil, "unexpected error: #{resp.error.inspect}"
       expect(resp.status_code).to eq(200)
       expect(resp.done).to be true
-      # In buffered mode, body is written via a single signal_data call
       expect(resp.body_chunks.size).to eq(1)
       echo = JSON.parse(resp.body_chunks.first)
       expect(echo["method"]).to eq("POST")
@@ -411,14 +390,11 @@ RSpec.describe AwsCrt::Http::Handler do
     it "returns a Response even on error" do
       context = build_context(method: "GET", path: "/err")
 
-      fake_pool = Object.new
-      def fake_pool.request(*)
+      fake_client = Object.new
+      def fake_client.request(*)
         raise AwsCrt::Http::Error, "boom"
       end
-
-      fake_manager = Object.new
-      fake_manager.define_singleton_method(:pool_for) { |_| fake_pool }
-      context.config.crt_pool_manager = fake_manager
+      context.config.crt_http_client = fake_client
 
       result = described_class.new.call(context)
       expect(result).to be_a(Seahorse::Client::Response)

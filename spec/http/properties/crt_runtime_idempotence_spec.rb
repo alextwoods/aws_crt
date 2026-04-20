@@ -10,9 +10,9 @@
 # **Validates: Requirements 2.4**
 #
 # Since CrtRuntime is not directly exposed to Ruby, we observe idempotence
-# through the ConnectionPool: creating pools from multiple concurrent threads
+# through the Client: creating clients from multiple concurrent threads
 # must all succeed (proving the shared runtime initialized correctly) and the
-# pools must all function (proving the shared resources are valid).
+# clients must all function (proving the shared resources are valid).
 
 require "socket"
 require "rantly"
@@ -45,14 +45,14 @@ RSpec.describe "Property 1: CRT Resource Initialization Idempotence" do
     server&.close
   end
 
-  it "concurrent pool creation from random thread counts always succeeds" do
+  it "concurrent client creation from random thread counts always succeeds" do
     with_http_server do |port|
       property_of {
-        # Generate between 2 and 8 threads, each creating 1-3 pools
+        # Generate between 2 and 8 threads, each creating 1-3 clients
         num_threads = range(2, 8)
-        pools_per_thread = range(1, 3)
-        [num_threads, pools_per_thread]
-      }.check(10) do |(num_threads, pools_per_thread)|
+        clients_per_thread = range(1, 3)
+        [num_threads, clients_per_thread]
+      }.check(10) do |(num_threads, clients_per_thread)|
         endpoint = "http://127.0.0.1:#{port}"
         results = Array.new(num_threads)
         errors = []
@@ -60,12 +60,12 @@ RSpec.describe "Property 1: CRT Resource Initialization Idempotence" do
 
         threads = num_threads.times.map do |i|
           Thread.new do
-            thread_pools = []
-            pools_per_thread.times do
-              pool = AwsCrt::Http::ConnectionPool.new(endpoint)
-              thread_pools << pool
+            thread_clients = []
+            clients_per_thread.times do
+              client = AwsCrt::Http::Client.new
+              thread_clients << client
             end
-            results[i] = thread_pools
+            results[i] = thread_clients
           rescue => e
             mutex.synchronize { errors << e }
           end
@@ -76,18 +76,18 @@ RSpec.describe "Property 1: CRT Resource Initialization Idempotence" do
         # All threads must complete without errors — this proves the
         # runtime initialization is thread-safe and idempotent.
         expect(errors).to be_empty,
-          "Expected no errors from concurrent pool creation, got: #{errors.map(&:message)}"
+          "Expected no errors from concurrent client creation, got: #{errors.map(&:message)}"
 
-        # Every thread must have created the expected number of pools.
-        results.each_with_index do |pools, i|
-          expect(pools).not_to be_nil, "Thread #{i} produced nil result"
-          expect(pools.length).to eq(pools_per_thread)
+        # Every thread must have created the expected number of clients.
+        results.each_with_index do |clients, i|
+          expect(clients).not_to be_nil, "Thread #{i} produced nil result"
+          expect(clients.length).to eq(clients_per_thread)
         end
       end
     end
   end
 
-  it "pools created from different threads all produce valid responses" do
+  it "clients created from different threads all produce valid responses" do
     with_http_server do |port|
       property_of {
         range(2, 6)
@@ -99,9 +99,9 @@ RSpec.describe "Property 1: CRT Resource Initialization Idempotence" do
 
         threads = num_threads.times.map do |i|
           Thread.new do
-            pool = AwsCrt::Http::ConnectionPool.new(endpoint)
+            client = AwsCrt::Http::Client.new
             headers = [["Host", "127.0.0.1:#{port}"]]
-            status, _resp_headers, body = pool.request("GET", "/test", headers)
+            status, _resp_headers, body = client.request(endpoint, "GET", "/test", headers)
             responses[i] = { status: status, body: body }
           rescue => e
             mutex.synchronize { errors << e }
@@ -113,7 +113,7 @@ RSpec.describe "Property 1: CRT Resource Initialization Idempotence" do
         expect(errors).to be_empty,
           "Expected no errors from concurrent requests, got: #{errors.map(&:message)}"
 
-        # Every thread's pool must have produced a valid response,
+        # Every thread's client must have produced a valid response,
         # proving the shared CRT runtime resources are functional.
         responses.each_with_index do |resp, i|
           expect(resp).not_to be_nil, "Thread #{i} produced nil response"

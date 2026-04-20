@@ -72,8 +72,8 @@ RSpec.describe "Property 4: Streaming Body Integrity" do
     server&.close
   end
 
-  def make_pool
-    AwsCrt::Http::ConnectionPool.new("http://127.0.0.1:#{@port}")
+  def make_client
+    AwsCrt::Http::Client.new
   end
 
   def request_headers
@@ -95,17 +95,17 @@ RSpec.describe "Property 4: Streaming Body Integrity" do
       body = body_size.times.map { rand(0..255).chr }.join.b
       StreamingBodyServer.next_response_body = body
 
-      pool = make_pool
+      client = make_client
 
       # Buffered request
-      _status_b, _headers_b, buffered_body = pool.request(
+      _status_b, _headers_b, buffered_body = client.request("http://127.0.0.1:#{@port}", 
         "GET", "/buffered", request_headers
       )
 
       # Streaming request — collect all yielded chunks
       StreamingBodyServer.next_response_body = body
       chunks = []
-      _status_s, _headers_s = pool.request(
+      _status_s, _headers_s = client.request("http://127.0.0.1:#{@port}", 
         "GET", "/streaming", request_headers
       ) { |chunk| chunks << chunk.b }
 

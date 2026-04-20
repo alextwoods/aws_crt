@@ -1,8 +1,6 @@
 # frozen_string_literal: true
 
 require_relative "errors"
-require_relative "connection_pool"
-require_relative "connection_pool_manager"
 
 module AwsCrt
   module Http
@@ -10,14 +8,19 @@ module AwsCrt
     #
     # Drop-in replacement for `Seahorse::Client::NetHttp::Handler`.
     # Register via {Plugin} or manually on a service client.
+    #
+    # The handler is stateless — it reads the shared {Client} from
+    # `context.config.crt_http_client` on each call. The {Client}
+    # manages connection pools internally and is Ractor-shareable
+    # when frozen.
     class Handler < Seahorse::Client::Handler
       # @param context [Seahorse::Client::RequestContext]
       # @return [Seahorse::Client::Response]
       def call(context)
-        pool = pool_for(context)
+        client = context.config.crt_http_client
         resp = context.http_response
         start = monotonic_time
-        send_request(pool, context.http_request, resp, streaming?(context))
+        send_request(client, context.http_request, resp, streaming?(context))
         log_request(context, start)
       rescue AwsCrt::Http::Error => e
         context.http_response.signal_error(
@@ -29,43 +32,37 @@ module AwsCrt
 
       private
 
-      def send_request(pool, req, resp, streaming)
+      def send_request(client, req, resp, streaming)
+        endpoint = "#{req.endpoint.scheme}://#{req.endpoint.host}:#{req.endpoint.port}"
         method = req.http_method
         path = req.endpoint.request_uri
         headers = build_headers(req)
         body = read_body(req.body)
 
         if streaming
-          stream_response(pool, method, path, headers, body, resp)
+          stream_response(client, endpoint, method, path, headers, body, resp)
         else
-          buffer_response(pool, method, path, headers, body, resp)
+          buffer_response(client, endpoint, method, path, headers, body, resp)
         end
       end
 
-      def buffer_response(pool, method, path, headers, body, resp) # rubocop:disable Metrics/ParameterLists
-        args = [method, path, headers]
+      def buffer_response(client, endpoint, method, path, headers, body, resp) # rubocop:disable Metrics/ParameterLists
+        args = [endpoint, method, path, headers]
         args << body unless body.nil?
-        t = Time.now
-        status, resp_headers, resp_body = pool.request(*args)
+        status, resp_headers, resp_body = client.request(*args)
         resp.signal_headers(status, headers_to_hash(resp_headers))
         resp.signal_data(resp_body) unless resp_body.empty?
         resp.signal_done
       end
 
-      def stream_response(pool, method, path, headers, body, resp) # rubocop:disable Metrics/ParameterLists
-        args = [method, path, headers]
+      def stream_response(client, endpoint, method, path, headers, body, resp) # rubocop:disable Metrics/ParameterLists
+        args = [endpoint, method, path, headers]
         args << body unless body.nil?
-        status, resp_headers = pool.request(*args) do |chunk|
+        status, resp_headers = client.request(*args) do |chunk|
           resp.signal_data(chunk)
         end
         resp.signal_headers(status, headers_to_hash(resp_headers))
         resp.signal_done
-      end
-
-      def pool_for(context)
-        pool_manager = context.config.crt_pool_manager
-        endpoint = context.http_request.endpoint
-        pool_manager.pool_for("#{endpoint.scheme}://#{endpoint.host}:#{endpoint.port}")
       end
 
       def build_headers(req)

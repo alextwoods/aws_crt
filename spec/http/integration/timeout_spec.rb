@@ -29,8 +29,7 @@ RSpec.describe "Timeout integration" do
 
   describe "read timeout" do
     before(:all) do
-      @timeout_pool = AwsCrt::Http::ConnectionPool.new(
-        @server.endpoint,
+      @timeout_client = AwsCrt::Http::Client.new(
         read_timeout_ms: 1_000
       )
     end
@@ -38,13 +37,13 @@ RSpec.describe "Timeout integration" do
     it "raises an error when the server response is delayed beyond the read timeout" do
       # Server delays 5 seconds, but our read timeout is 1 second
       expect {
-        @timeout_pool.request("GET", "/slow?delay=5", [host_header])
+        @timeout_client.request(@server.endpoint, "GET", "/slow?delay=5", [host_header])
       }.to raise_error(AwsCrt::Http::Error)
     end
 
     it "succeeds when the server responds within the read timeout" do
       # No delay — should complete well within 1 second
-      status, _headers, body = @timeout_pool.request("GET", "/fast", [host_header])
+      status, _headers, body = @timeout_client.request(@server.endpoint, "GET", "/fast", [host_header])
 
       expect(status).to eq(200)
       echo = parse_echo(body)
@@ -57,24 +56,23 @@ RSpec.describe "Timeout integration" do
     it "raises an error when connecting to a non-routable address" do
       # 192.0.2.1 is TEST-NET-1 (RFC 5737), guaranteed non-routable.
       # Use a very short timeout to avoid slow tests.
-      pool = AwsCrt::Http::ConnectionPool.new(
-        "http://192.0.2.1:80",
+      client = AwsCrt::Http::Client.new(
         connect_timeout_ms: 500
       )
 
       expect {
-        pool.request("GET", "/", [["Host", "192.0.2.1"]])
+        client.request("http://192.0.2.1:80", "GET", "/", [["Host", "192.0.2.1"]])
       }.to raise_error(AwsCrt::Http::Error)
     end
   end
 
   describe "default timeouts" do
     it "completes a normal request with default timeout configuration" do
-      # A pool with no explicit timeout config should use reasonable defaults
+      # A client with no explicit timeout config should use reasonable defaults
       # and complete normal requests without issue.
-      pool = AwsCrt::Http::ConnectionPool.new(@server.endpoint)
+      client = AwsCrt::Http::Client.new
 
-      status, _headers, body = pool.request("GET", "/defaults", [host_header])
+      status, _headers, body = client.request(@server.endpoint, "GET", "/defaults", [host_header])
 
       expect(status).to eq(200)
       echo = parse_echo(body)

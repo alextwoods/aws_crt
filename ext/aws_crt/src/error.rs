@@ -1,4 +1,5 @@
 use std::ffi::CStr;
+use std::sync::OnceLock;
 
 use magnus::exception::ExceptionClass;
 use magnus::rb_sys::{AsRawValue, FromRawValue};
@@ -15,14 +16,14 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
-// Ruby exception class cache (raw VALUEs for Send/Sync safety)
+// Ruby exception class cache (OnceLock for Ractor/thread safety)
 // ---------------------------------------------------------------------------
 
-static mut HTTP_ERROR: VALUE = 0;
-static mut HTTP_CONNECTION_ERROR: VALUE = 0;
-static mut HTTP_TIMEOUT_ERROR: VALUE = 0;
-static mut HTTP_TLS_ERROR: VALUE = 0;
-static mut HTTP_PROXY_ERROR: VALUE = 0;
+static HTTP_ERROR: OnceLock<VALUE> = OnceLock::new();
+static HTTP_CONNECTION_ERROR: OnceLock<VALUE> = OnceLock::new();
+static HTTP_TIMEOUT_ERROR: OnceLock<VALUE> = OnceLock::new();
+static HTTP_TLS_ERROR: OnceLock<VALUE> = OnceLock::new();
+static HTTP_PROXY_ERROR: OnceLock<VALUE> = OnceLock::new();
 
 /// Register the HTTP error hierarchy under `AwsCrt::Http` and cache the
 /// exception classes for later use by `CrtError`.
@@ -44,23 +45,21 @@ pub fn define_http_errors(
     let tls_error = http_module.define_error("TlsError", error)?;
     let proxy_error = http_module.define_error("ProxyError", error)?;
 
-    unsafe {
-        HTTP_ERROR = error.as_raw();
-        HTTP_CONNECTION_ERROR = connection_error.as_raw();
-        HTTP_TIMEOUT_ERROR = timeout_error.as_raw();
-        HTTP_TLS_ERROR = tls_error.as_raw();
-        HTTP_PROXY_ERROR = proxy_error.as_raw();
-    }
+    HTTP_ERROR.set(error.as_raw()).ok();
+    HTTP_CONNECTION_ERROR.set(connection_error.as_raw()).ok();
+    HTTP_TIMEOUT_ERROR.set(timeout_error.as_raw()).ok();
+    HTTP_TLS_ERROR.set(tls_error.as_raw()).ok();
+    HTTP_PROXY_ERROR.set(proxy_error.as_raw()).ok();
 
     Ok(())
 }
-
 
 /// Retrieve a cached exception class from its raw VALUE.
 ///
 /// SAFETY: Must only be called after `define_http_errors` has run and
 /// while the GVL is held.
-unsafe fn exception_class(raw: VALUE) -> ExceptionClass {
+unsafe fn exception_class(lock: &OnceLock<VALUE>) -> ExceptionClass {
+    let raw = *lock.get().expect("error class not initialized");
     let val = Value::from_raw(raw);
     ExceptionClass::from_value(val)
         .expect("cached VALUE is not an ExceptionClass")
@@ -148,16 +147,16 @@ impl From<CrtError> for Error {
 /// `define_http_errors` has initialized the class cache.
 unsafe fn classify_error(name: &str) -> ExceptionClass {
     if name.starts_with("AWS_IO_TLS_") || name == "AWS_IO_TLS_CTX_ERROR" {
-        exception_class(HTTP_TLS_ERROR)
+        exception_class(&HTTP_TLS_ERROR)
     } else if name.starts_with("AWS_IO_DNS_") {
-        exception_class(HTTP_CONNECTION_ERROR)
+        exception_class(&HTTP_CONNECTION_ERROR)
     } else if name == "AWS_IO_SOCKET_TIMEOUT" {
-        exception_class(HTTP_TIMEOUT_ERROR)
+        exception_class(&HTTP_TIMEOUT_ERROR)
     } else if name.starts_with("AWS_IO_SOCKET_") {
-        exception_class(HTTP_CONNECTION_ERROR)
+        exception_class(&HTTP_CONNECTION_ERROR)
     } else if name.starts_with("AWS_ERROR_HTTP_PROXY_") {
-        exception_class(HTTP_PROXY_ERROR)
+        exception_class(&HTTP_PROXY_ERROR)
     } else {
-        exception_class(HTTP_ERROR)
+        exception_class(&HTTP_ERROR)
     }
 }

@@ -14,7 +14,7 @@ require "support/test_server"
 RSpec.describe "Streaming response integration" do
   before(:all) do
     @server = TestServer.start
-    @pool = AwsCrt::Http::ConnectionPool.new(@server.endpoint)
+    @client = AwsCrt::Http::Client.new
   end
 
   after(:all) do
@@ -28,7 +28,7 @@ RSpec.describe "Streaming response integration" do
   describe "small body streaming" do
     it "yields the complete body via streaming block" do
       chunks = []
-      status, _headers = @pool.request("GET", "/small", [host_header]) do |chunk|
+      status, _headers = @client.request(@server.endpoint, "GET", "/small", [host_header]) do |chunk|
         chunks << chunk
       end
 
@@ -44,7 +44,7 @@ RSpec.describe "Streaming response integration" do
     it "yields the full body in multiple chunks for a 128KB response" do
       body_size = 128 * 1024
       chunks = []
-      status, _headers = @pool.request(
+      status, _headers = @client.request(@server.endpoint, 
         "GET", "/large?body_size=#{body_size}", [host_header]
       ) do |chunk|
         chunks << chunk
@@ -64,11 +64,11 @@ RSpec.describe "Streaming response integration" do
       path = "/equiv?body_size=4096"
 
       # Buffered
-      _status_b, _headers_b, buffered_body = @pool.request("GET", path, [host_header])
+      _status_b, _headers_b, buffered_body = @client.request(@server.endpoint, "GET", path, [host_header])
 
       # Streamed
       chunks = []
-      _status_s, _headers_s = @pool.request("GET", path, [host_header]) do |chunk|
+      _status_s, _headers_s = @client.request(@server.endpoint, "GET", path, [host_header]) do |chunk|
         chunks << chunk
       end
       streamed_body = chunks.join

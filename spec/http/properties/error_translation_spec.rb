@@ -67,14 +67,13 @@ RSpec.describe "Property 7: CRT Error Translation" do
     }.check(10) do |_|
       port = find_unused_port
 
-      pool = AwsCrt::Http::ConnectionPool.new(
-        "http://127.0.0.1:#{port}",
-        { connect_timeout_ms: 2_000 }
+      client = AwsCrt::Http::Client.new(
+        connect_timeout_ms: 2_000
       )
 
       error = nil
       begin
-        pool.request("GET", "/", [["Host", "127.0.0.1:#{port}"]])
+        client.request("http://127.0.0.1:#{port}", "GET", "/", [["Host", "127.0.0.1:#{port}"]])
       rescue AwsCrt::Http::Error => e
         error = e
       rescue StandardError => e
@@ -101,14 +100,13 @@ RSpec.describe "Property 7: CRT Error Translation" do
     }.check(10) do |_|
       port = find_unused_port
 
-      pool = AwsCrt::Http::ConnectionPool.new(
-        "http://127.0.0.1:#{port}",
-        { connect_timeout_ms: 2_000 }
+      client = AwsCrt::Http::Client.new(
+        connect_timeout_ms: 2_000
       )
 
       error = nil
       begin
-        pool.request("GET", "/", [["Host", "127.0.0.1:#{port}"]])
+        client.request("http://127.0.0.1:#{port}", "GET", "/", [["Host", "127.0.0.1:#{port}"]])
       rescue AwsCrt::Http::Error => e
         error = e
       end

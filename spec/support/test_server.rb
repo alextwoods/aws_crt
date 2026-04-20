@@ -281,7 +281,7 @@ class TestServer
     cleanup_tls
   end
 
-  # Convenience endpoint string for ConnectionPool.
+  # Convenience endpoint string for Client.
   def endpoint
     scheme = @tls ? "https" : "http"
     "#{scheme}://127.0.0.1:#{@port}"

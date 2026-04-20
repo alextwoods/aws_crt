@@ -12,10 +12,11 @@ Gem::Specification.new do |spec|
   spec.description = "High-performance CRC32, CRC32C, and CRC64-NVME checksums, " \
                      "CBOR encoding, and an HTTP/1.1 client with connection pooling " \
                      "using the AWS Common Runtime (CRT) with hardware acceleration, " \
-                     "exposed to Ruby via a Rust native extension."
+                     "exposed to Ruby via a Rust native extension. " \
+                     "The HTTP client is Ractor-shareable for Ruby 4+ parallel execution."
   spec.homepage = "https://github.com/awslabs/aws_crt"
   spec.license = "MIT"
-  spec.required_ruby_version = ">= 3.0.0"
+  spec.required_ruby_version = ">= 4.0.0"
   spec.required_rubygems_version = ">= 3.3.11"
 
   spec.metadata["homepage_uri"] = spec.homepage

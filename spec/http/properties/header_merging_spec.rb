@@ -87,8 +87,8 @@ RSpec.describe "Property 3: Duplicate Header Merging" do
     "X-Dup-#{index}-#{suffix}"
   end
 
-  def make_pool
-    AwsCrt::Http::ConnectionPool.new("http://127.0.0.1:#{@port}")
+  def make_client
+    AwsCrt::Http::Client.new
   end
 
   it "merges duplicate non-Set-Cookie headers into comma-separated values" do
@@ -113,8 +113,8 @@ RSpec.describe "Property 3: Duplicate Header Merging" do
 
       DuplicateHeaderServer.next_response_headers = raw_headers
 
-      pool = make_pool
-      _status, resp_headers, _body = pool.request(
+      client = make_client
+      _status, resp_headers, _body = client.request("http://127.0.0.1:#{@port}", 
         "GET", "/", [["Host", "127.0.0.1:#{@port}"]]
       )
 
@@ -149,8 +149,8 @@ RSpec.describe "Property 3: Duplicate Header Merging" do
 
       DuplicateHeaderServer.next_response_headers = raw_headers
 
-      pool = make_pool
-      _status, resp_headers, _body = pool.request(
+      client = make_client
+      _status, resp_headers, _body = client.request("http://127.0.0.1:#{@port}", 
         "GET", "/", [["Host", "127.0.0.1:#{@port}"]]
       )
 

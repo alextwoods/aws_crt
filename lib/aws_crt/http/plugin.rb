@@ -10,6 +10,10 @@ module AwsCrt
     # Configuration options mirror the standard SDK HTTP options so
     # the CRT handler is a transparent replacement for Net::HTTP.
     #
+    # The plugin creates a single {Client} instance per SDK client
+    # configuration. The {Client} is frozen and Ractor-shareable,
+    # managing connection pools internally.
+    #
     # @example Manual registration
     #   Aws::S3::Client.add_plugin(AwsCrt::Http::Plugin)
     #   client = Aws::S3::Client.new(region: "us-east-1")
@@ -23,8 +27,8 @@ module AwsCrt
       option(:max_connection_idle_ms, default: 60_000)
       option(:logger, default: nil)
 
-      option(:crt_pool_manager) do |config|
-        AwsCrt::Http::ConnectionPoolManager.new(
+      option(:crt_http_client) do |config|
+        client = AwsCrt::Http::Client.new(
           max_connections: config.max_connections,
           max_connection_idle_ms: config.max_connection_idle_ms,
           connect_timeout_ms: (config.http_open_timeout * 1000).to_i,
@@ -33,6 +37,8 @@ module AwsCrt
           ssl_ca_bundle: config.ssl_ca_bundle,
           proxy: config.http_proxy
         )
+        client.freeze
+        client
       end
 
       handler(Handler, step: :send)

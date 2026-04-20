@@ -1,71 +1,104 @@
 # frozen_string_literal: true
 
-# Feature: crt-http-client, Property 5: Connection Pool Endpoint Affinity
+# Feature: crt-http-client, Property 5: Multi-Endpoint Client Routing
 #
-# For any sequence of requests to a set of endpoints, the
-# ConnectionPoolManager SHALL return the same ConnectionPool instance for
-# requests to the same endpoint, and distinct ConnectionPool instances for
-# requests to different endpoints.
-# Formally: pool_for(e1) == pool_for(e1) and
-#           e1 != e2 → pool_for(e1) != pool_for(e2)
+# For any sequence of requests to a set of distinct endpoints, a single
+# Client instance SHALL successfully route requests to the correct
+# endpoint and return valid responses from each. The Client manages
+# connection pools internally, so callers need only a single Client
+# to reach multiple endpoints.
 #
 # **Validates: Requirements 8.5**
 
+require "socket"
+require "json"
 require "rantly"
 require "rantly/rspec_extensions"
-require_relative "../../../lib/aws_crt/http/connection_pool_manager"
+require "aws_crt"
 
-RSpec.describe "Property 5: Connection Pool Endpoint Affinity" do
-  # Generate distinct endpoint strings using unique ports on 127.0.0.1.
-  # Using HTTP avoids TLS setup and DNS resolution.
-  def generate_endpoints(count)
-    base_port = rand(30_000..39_999)
-    count.times.map { |i| "http://127.0.0.1:#{base_port + i}" }
+# Minimal echo server that includes the port in the response so we can
+# verify which server handled the request.
+module AffinityEchoServer
+  def self.start
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+    thread = Thread.new { accept_loop(server, port) }
+    [server, thread, port]
   end
 
-  it "pool_for returns the same instance for the same endpoint across random access patterns" do
-    property_of {
-      num_endpoints = range(1, 6)
-      num_lookups = range(5, 30)
-      [num_endpoints, num_lookups]
-    }.check(20) do |(num_endpoints, num_lookups)|
-      endpoints = generate_endpoints(num_endpoints)
-      manager = AwsCrt::Http::ConnectionPoolManager.new
-
-      # Build a random sequence of endpoint lookups
-      lookup_sequence = num_lookups.times.map { endpoints.sample }
-
-      # Record the pool returned for each endpoint on first access
-      first_pool_for = {}
-      lookup_sequence.each do |ep|
-        pool = manager.pool_for(ep)
-        if first_pool_for.key?(ep)
-          # Same endpoint must return the identical object
-          msg = "pool_for(#{ep.inspect}) returned a different instance " \
-                "(expected object_id #{first_pool_for[ep].object_id}, " \
-                "got #{pool.object_id})"
-          expect(pool).to equal(first_pool_for[ep]), msg
-        else
-          first_pool_for[ep] = pool
-        end
-      end
+  def self.accept_loop(server, port)
+    loop do
+      client = server.accept
+      handle(client, port)
+    rescue IOError, Errno::EPIPE, Errno::ECONNRESET
+      # Client disconnected — continue accepting
     end
   end
 
-  it "pool_for returns distinct instances for different endpoints" do
+  def self.handle(client, port)
+    request_line = client.gets
+    return unless request_line
+
+    method, path, = request_line.strip.split(" ", 3)
+
+    # Drain request headers
+    nil while (line = client.gets) && line.strip != ""
+
+    body = JSON.generate("method" => method, "path" => path, "port" => port)
+    head = "HTTP/1.1 200 OK\r\n" \
+           "Content-Type: application/json\r\n" \
+           "Content-Length: #{body.bytesize}\r\n" \
+           "Connection: close\r\n\r\n"
+    client.write(head)
+    client.write(body)
+  ensure
+    client&.close
+  end
+end
+
+RSpec.describe "Property 5: Multi-Endpoint Client Routing" do
+  it "a single Client routes requests to the correct endpoint among multiple servers" do
     property_of {
-      range(2, 6)
-    }.check(20) do |num_endpoints|
-      endpoints = generate_endpoints(num_endpoints)
-      manager = AwsCrt::Http::ConnectionPoolManager.new
+      range(2, 5)
+    }.check(15) do |num_servers|
+      servers = num_servers.times.map { AffinityEchoServer.start }
 
-      endpoint_pool_pairs = endpoints.map { |ep| [ep, manager.pool_for(ep)] }
+      begin
+        client = AwsCrt::Http::Client.new
 
-      # Every pair of different endpoints must yield different pool objects
-      endpoint_pool_pairs.combination(2).each do |(ep_a, pool_a), (ep_b, pool_b)|
-        msg = "Expected distinct pools for #{ep_a.inspect} and #{ep_b.inspect}, " \
-              "but got the same instance (object_id #{pool_a.object_id})"
-        expect(pool_a).not_to equal(pool_b), msg
+        # Send a request to each server and verify the response came
+        # from the correct one (identified by port number).
+        servers.each do |_server, _thread, port|
+          endpoint = "http://127.0.0.1:#{port}"
+          headers = [["Host", "127.0.0.1:#{port}"]]
+          status, _, resp_body = client.request(endpoint, "GET", "/affinity", headers)
+
+          expect(status).to eq(200),
+            "Request to port #{port} returned status #{status}, expected 200"
+
+          echo = JSON.parse(resp_body)
+          expect(echo["port"]).to eq(port),
+            "Expected response from port #{port}, got port #{echo["port"]}"
+          expect(echo["path"]).to eq("/affinity"),
+            "Expected path /affinity, got #{echo["path"].inspect}"
+        end
+
+        # Send a second round to verify repeated requests still route correctly
+        servers.each do |_server, _thread, port|
+          endpoint = "http://127.0.0.1:#{port}"
+          headers = [["Host", "127.0.0.1:#{port}"]]
+          status, _, resp_body = client.request(endpoint, "GET", "/again", headers)
+
+          expect(status).to eq(200)
+          echo = JSON.parse(resp_body)
+          expect(echo["port"]).to eq(port),
+            "Repeated request: expected port #{port}, got #{echo["port"]}"
+        end
+      ensure
+        servers.each do |server, thread, _port|
+          thread&.kill
+          server&.close
+        end
       end
     end
   end

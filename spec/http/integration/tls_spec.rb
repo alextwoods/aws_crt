@@ -33,14 +33,13 @@ RSpec.describe "TLS integration" do
 
   describe "HTTPS with ssl_verify_peer disabled" do
     before(:all) do
-      @pool = AwsCrt::Http::ConnectionPool.new(
-        @server.endpoint,
+      @client = AwsCrt::Http::Client.new(
         ssl_verify_peer: false
       )
     end
 
     it "completes a GET request over HTTPS" do
-      status, _headers, body = @pool.request("GET", "/tls-test", [host_header])
+      status, _headers, body = @client.request(@server.endpoint, "GET", "/tls-test", [host_header])
 
       expect(status).to eq(200)
       echo = parse_echo(body)
@@ -55,7 +54,7 @@ RSpec.describe "TLS integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @pool.request("POST", "/secure", request_headers, request_body)
+      status, _headers, body = @client.request(@server.endpoint, "POST", "/secure", request_headers, request_body)
 
       expect(status).to eq(200)
       echo = parse_echo(body)
@@ -64,7 +63,7 @@ RSpec.describe "TLS integration" do
     end
 
     it "returns correct response headers over HTTPS" do
-      _status, headers, _body = @pool.request("GET", "/", [host_header])
+      _status, headers, _body = @client.request(@server.endpoint, "GET", "/", [host_header])
 
       header_hash = headers.to_h { |k, v| [k.downcase, v] }
       expect(header_hash["content-type"]).to eq("application/json")
@@ -74,13 +73,12 @@ RSpec.describe "TLS integration" do
 
   describe "TLS handshake failure" do
     it "raises an error when connecting to a self-signed cert with verification enabled" do
-      pool = AwsCrt::Http::ConnectionPool.new(
-        @server.endpoint,
+      client = AwsCrt::Http::Client.new(
         ssl_verify_peer: true
       )
 
       expect {
-        pool.request("GET", "/should-fail", [host_header])
+        client.request(@server.endpoint, "GET", "/should-fail", [host_header])
       }.to raise_error(AwsCrt::Http::Error)
     end
   end

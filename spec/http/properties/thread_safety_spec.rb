@@ -11,7 +11,7 @@
 #
 # Strategy: We start a local echo server that reflects a unique
 # X-Request-Id header back in the response body. Multiple Ruby threads
-# share a single ConnectionPool and each sends a request with a unique
+# share a single Client and each sends a request with a unique
 # identifier. We verify that every thread completes without error and
 # that each response contains the correct identifier — proving there
 # is no cross-contamination between concurrent requests.
@@ -93,15 +93,15 @@ RSpec.describe "Property 9: Multi-Threaded Request Safety" do
     server&.close
   end
 
-  def make_pool
-    AwsCrt::Http::ConnectionPool.new("http://127.0.0.1:#{@port}")
+  def make_client
+    AwsCrt::Http::Client.new
   end
 
-  it "concurrent threads sharing a pool all receive correctly matched responses" do
+  it "concurrent threads sharing a client all receive correctly matched responses" do
     property_of {
       range(2, 10)
     }.check(15) do |num_threads|
-      pool = make_pool
+      client = make_client
 
       # Each thread gets a unique request ID and path
       threads = num_threads.times.map do |i|
@@ -111,7 +111,7 @@ RSpec.describe "Property 9: Multi-Threaded Request Safety" do
             ["Host", "127.0.0.1:#{@port}"],
             ["X-Request-Id", rid]
           ]
-          status, _, resp_body = pool.request("GET", "/thread/#{rid}", headers)
+          status, _, resp_body = client.request("http://127.0.0.1:#{@port}", "GET", "/thread/#{rid}", headers)
           { request_id: rid, status: status, body: resp_body }
         end
       end
@@ -150,7 +150,7 @@ RSpec.describe "Property 9: Multi-Threaded Request Safety" do
     property_of {
       range(2, 8)
     }.check(10) do |num_threads|
-      pool = make_pool
+      client = make_client
 
       threads = num_threads.times.map do |i|
         request_id = "body-#{i}-#{rand(100_000..999_999)}"
@@ -161,7 +161,7 @@ RSpec.describe "Property 9: Multi-Threaded Request Safety" do
             ["X-Request-Id", rid],
             ["Content-Length", req_body.bytesize.to_s]
           ]
-          status, _, resp_body = pool.request("POST", "/thread/#{rid}", headers, req_body)
+          status, _, resp_body = client.request("http://127.0.0.1:#{@port}", "POST", "/thread/#{rid}", headers, req_body)
           { request_id: rid, status: status, body: resp_body, sent_body: req_body }
         end
       end

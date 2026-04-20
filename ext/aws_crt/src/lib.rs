@@ -7,12 +7,13 @@ pub mod connection_manager;
 pub mod credentials;
 pub mod error;
 pub mod http;
-pub mod pool;
+pub mod http_client;
 pub mod proxy;
 pub mod runtime;
 pub mod s3_client;
 pub mod s3_request;
 pub mod s3_ruby;
+pub mod ractor_test;
 pub mod signing;
 pub mod tls;
 
@@ -119,8 +120,24 @@ fn crc64nvme(args: &[Value]) -> Result<u64, Error> {
     }
 }
 
+/// Mark the extension as Ractor-safe.
+///
+/// Uses a direct extern "C" declaration with c_int to avoid any potential
+/// type mismatch issues with the rb_sys bindings.
+#[inline(never)]
+fn mark_ractor_safe() {
+    extern "C" {
+        fn rb_ext_ractor_safe(flag: std::ffi::c_int);
+    }
+    unsafe { rb_ext_ractor_safe(1) };
+}
+
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
+    // Mark the extension as Ractor-safe. Must be called from the Init_
+    // function BEFORE any rb_define_method calls.
+    mark_ractor_safe();
+
     init_crt();
 
     let module = ruby.define_module("AwsCrt")?;
@@ -135,11 +152,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // HTTP module and error hierarchy
     let http = module.define_module("Http")?;
     error::define_http_errors(ruby, &http)?;
-    pool::define_connection_pool(ruby, &http)?;
+    http_client::define_http_client(ruby, &http)?;
 
     // S3 module
     let s3 = module.define_module("S3")?;
     s3_ruby::define_s3_client(ruby, &s3)?;
+
+    // Ractor test struct (minimal frozen_shareable demo)
+    ractor_test::define_ractor_test(ruby, &module)?;
 
     Ok(())
 }

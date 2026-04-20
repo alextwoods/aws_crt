@@ -11,7 +11,7 @@
 # Strategy: The Handler requires Seahorse (aws-sdk-core), which is not
 # in the test group. We define minimal stub classes that satisfy the
 # Handler's interface, then exercise the full call(context) path with
-# a real ConnectionPool and a local echo server. A StringIO-backed
+# a real Client and a local echo server. A StringIO-backed
 # Logger captures the debug output, which we parse and verify.
 
 require "socket"
@@ -133,7 +133,7 @@ module LoggingStubs
     end
   end
 
-  Config = Struct.new(:crt_pool_manager, :logger, keyword_init: true)
+  Config = Struct.new(:crt_http_client, :logger, keyword_init: true)
 
   Context = Struct.new(:http_request, :http_response, :config, :metadata) do
     def initialize(*)
@@ -161,11 +161,11 @@ RSpec.describe "Property 8: Debug Logging Completeness" do
   # passing an explicit nil body to the Rust pool raises TypeError.
   HTTP_METHODS = %w[POST PUT DELETE PATCH].freeze
 
-  def make_pool_manager
-    AwsCrt::Http::ConnectionPoolManager.new({})
+  def make_http_client
+    AwsCrt::Http::Client.new
   end
 
-  def build_context(method:, path:, port:, pool_manager:, logger:, body:)
+  def build_context(method:, path:, port:, http_client:, logger:, body:)
     uri = URI("http://127.0.0.1:#{port}#{path}")
     headers = LoggingStubs::Headers.new([
       ["Host", "127.0.0.1:#{port}"],
@@ -174,7 +174,7 @@ RSpec.describe "Property 8: Debug Logging Completeness" do
 
     request = LoggingStubs::Request.new(uri, method, headers, body)
     response = LoggingStubs::Response.new
-    config = LoggingStubs::Config.new(crt_pool_manager: pool_manager, logger: logger)
+    config = LoggingStubs::Config.new(crt_http_client: http_client, logger: logger)
     LoggingStubs::Context.new(request, response, config)
   end
 
@@ -205,10 +205,10 @@ RSpec.describe "Property 8: Debug Logging Completeness" do
       log_io = StringIO.new
       logger = Logger.new(log_io, level: Logger::DEBUG)
 
-      pool_manager = make_pool_manager
+      http_client = make_http_client
       context = build_context(
         method: method, path: path, port: @port,
-        pool_manager: pool_manager, logger: logger, body: body
+        http_client: http_client, logger: logger, body: body
       )
 
       handler = AwsCrt::Http::Handler.new

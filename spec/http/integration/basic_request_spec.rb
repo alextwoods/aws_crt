@@ -13,7 +13,7 @@ require "support/test_server"
 RSpec.describe "Basic HTTP request integration" do
   before(:all) do
     @server = TestServer.start
-    @pool = AwsCrt::Http::ConnectionPool.new(@server.endpoint)
+    @client = AwsCrt::Http::Client.new
   end
 
   after(:all) do
@@ -34,7 +34,7 @@ RSpec.describe "Basic HTTP request integration" do
 
   describe "HTTP methods" do
     it "sends a GET request and receives the echo response" do
-      status, _headers, body = @pool.request("GET", "/test", [host_header])
+      status, _headers, body = @client.request(@server.endpoint, "GET", "/test", [host_header])
 
       expect(status).to eq(200)
       echo = parse_echo(body)
@@ -50,7 +50,7 @@ RSpec.describe "Basic HTTP request integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @pool.request("POST", "/submit", request_headers, request_body)
+      status, _headers, body = @client.request(@server.endpoint, "POST", "/submit", request_headers, request_body)
 
       expect(status).to eq(200)
       echo = parse_echo(body)
@@ -67,7 +67,7 @@ RSpec.describe "Basic HTTP request integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @pool.request("PUT", "/resource/1", request_headers, request_body)
+      status, _headers, body = @client.request(@server.endpoint, "PUT", "/resource/1", request_headers, request_body)
 
       expect(status).to eq(200)
       echo = parse_echo(body)
@@ -77,7 +77,7 @@ RSpec.describe "Basic HTTP request integration" do
     end
 
     it "sends a DELETE request without a body" do
-      status, _headers, body = @pool.request("DELETE", "/resource/1", [host_header])
+      status, _headers, body = @client.request(@server.endpoint, "DELETE", "/resource/1", [host_header])
 
       expect(status).to eq(200)
       echo = parse_echo(body)
@@ -93,7 +93,7 @@ RSpec.describe "Basic HTTP request integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @pool.request("DELETE", "/resource/1", request_headers, request_body)
+      status, _headers, body = @client.request(@server.endpoint, "DELETE", "/resource/1", request_headers, request_body)
 
       expect(status).to eq(200)
       echo = parse_echo(body)
@@ -109,7 +109,7 @@ RSpec.describe "Basic HTTP request integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @pool.request("PATCH", "/resource/1", request_headers, request_body)
+      status, _headers, body = @client.request(@server.endpoint, "PATCH", "/resource/1", request_headers, request_body)
 
       expect(status).to eq(200)
       echo = parse_echo(body)
@@ -119,7 +119,7 @@ RSpec.describe "Basic HTTP request integration" do
     end
 
     it "sends a HEAD request and receives no body" do
-      status, headers, body = @pool.request("HEAD", "/info", [host_header])
+      status, headers, body = @client.request(@server.endpoint, "HEAD", "/info", [host_header])
 
       expect(status).to eq(200)
       expect(body).to eq("")
@@ -132,7 +132,7 @@ RSpec.describe "Basic HTTP request integration" do
   describe "requests without bodies" do
     %w[GET DELETE HEAD].each do |method|
       it "#{method} without a body succeeds" do
-        status, _headers, body = @pool.request(method, "/no-body", [host_header])
+        status, _headers, body = @client.request(@server.endpoint, method, "/no-body", [host_header])
 
         expect(status).to eq(200)
         next if method == "HEAD" # HEAD has no response body to parse
@@ -153,7 +153,7 @@ RSpec.describe "Basic HTTP request integration" do
           ["Content-Length", request_body.bytesize.to_s]
         ]
 
-        status, _headers, body = @pool.request(method, "/with-body", request_headers, request_body)
+        status, _headers, body = @client.request(@server.endpoint, method, "/with-body", request_headers, request_body)
 
         expect(status).to eq(200)
         echo = parse_echo(body)
@@ -165,28 +165,28 @@ RSpec.describe "Basic HTTP request integration" do
 
   describe "response status code" do
     it "returns 200 for a successful request" do
-      status, _headers, _body = @pool.request("GET", "/", [host_header])
+      status, _headers, _body = @client.request(@server.endpoint, "GET", "/", [host_header])
       expect(status).to eq(200)
     end
   end
 
   describe "response headers" do
     it "returns response headers as name-value pairs" do
-      _status, headers, _body = @pool.request("GET", "/", [host_header])
+      _status, headers, _body = @client.request(@server.endpoint, "GET", "/", [host_header])
 
       expect(headers).to be_an(Array)
       expect(headers).to all(be_an(Array).and(have_attributes(size: 2)))
     end
 
     it "includes Content-Type in the response" do
-      _status, headers, _body = @pool.request("GET", "/", [host_header])
+      _status, headers, _body = @client.request(@server.endpoint, "GET", "/", [host_header])
 
       header_hash = headers_hash(headers)
       expect(header_hash["content-type"]).to eq("application/json")
     end
 
     it "includes Content-Length in the response" do
-      _status, headers, body = @pool.request("GET", "/", [host_header])
+      _status, headers, body = @client.request(@server.endpoint, "GET", "/", [host_header])
 
       header_hash = headers_hash(headers)
       expect(header_hash["content-length"]).to eq(body.bytesize.to_s)
@@ -195,7 +195,7 @@ RSpec.describe "Basic HTTP request integration" do
 
   describe "response body" do
     it "returns the complete response body as a string" do
-      _status, _headers, body = @pool.request("GET", "/", [host_header])
+      _status, _headers, body = @client.request(@server.endpoint, "GET", "/", [host_header])
 
       expect(body).to be_a(String)
       echo = parse_echo(body)
@@ -204,7 +204,7 @@ RSpec.describe "Basic HTTP request integration" do
     end
 
     it "returns an empty body for HEAD requests" do
-      _status, _headers, body = @pool.request("HEAD", "/", [host_header])
+      _status, _headers, body = @client.request(@server.endpoint, "HEAD", "/", [host_header])
       expect(body).to eq("")
     end
   end
@@ -217,7 +217,7 @@ RSpec.describe "Basic HTTP request integration" do
         %w[X-Another another-value]
       ]
 
-      _status, _headers, body = @pool.request("GET", "/headers", request_headers)
+      _status, _headers, body = @client.request(@server.endpoint, "GET", "/headers", request_headers)
 
       echo = parse_echo(body)
       expect(echo["headers"]["X-Custom-Header"]).to eq("custom-value")
@@ -227,19 +227,19 @@ RSpec.describe "Basic HTTP request integration" do
 
   describe "request paths" do
     it "handles a root path" do
-      _status, _headers, body = @pool.request("GET", "/", [host_header])
+      _status, _headers, body = @client.request(@server.endpoint, "GET", "/", [host_header])
       echo = parse_echo(body)
       expect(echo["path"]).to eq("/")
     end
 
     it "handles nested paths" do
-      _status, _headers, body = @pool.request("GET", "/a/b/c/d", [host_header])
+      _status, _headers, body = @client.request(@server.endpoint, "GET", "/a/b/c/d", [host_header])
       echo = parse_echo(body)
       expect(echo["path"]).to eq("/a/b/c/d")
     end
 
     it "handles paths with query strings" do
-      _status, _headers, body = @pool.request("GET", "/search?q=test&page=1", [host_header])
+      _status, _headers, body = @client.request(@server.endpoint, "GET", "/search?q=test&page=1", [host_header])
       echo = parse_echo(body)
       expect(echo["path"]).to eq("/search")
       expect(echo["query"]).to include("q" => "test", "page" => "1")

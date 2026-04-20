@@ -11,8 +11,8 @@ RSpec.describe TestServer do
       @server&.stop
     end
 
-    def make_pool
-      AwsCrt::Http::ConnectionPool.new(@server.endpoint)
+    def make_client
+      AwsCrt::Http::Client.new
     end
 
     def host_header
@@ -20,12 +20,12 @@ RSpec.describe TestServer do
     end
 
     it "echoes request method, path, headers, and body as JSON" do
-      pool = make_pool
+      client = make_client
       headers = host_header + [%w[X-Custom hello]]
       body = "test body"
       request_headers = headers + [["Content-Length", body.bytesize.to_s]]
 
-      status, _, resp_body = pool.request("POST", "/echo", request_headers, body)
+      status, _, resp_body = client.request(@server.endpoint, "POST", "/echo", request_headers, body)
 
       expect(status).to eq(200)
       echo = JSON.parse(resp_body)
@@ -36,11 +36,11 @@ RSpec.describe TestServer do
     end
 
     it "supports configurable response delays via X-Delay header" do
-      pool = make_pool
+      client = make_client
       headers = host_header + [["X-Delay", "0.1"]]
 
       start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      status, = pool.request("GET", "/slow", headers)
+      status, = client.request(@server.endpoint, "GET", "/slow", headers)
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
 
       expect(status).to eq(200)
@@ -48,10 +48,10 @@ RSpec.describe TestServer do
     end
 
     it "supports configurable response delays via query parameter" do
-      pool = make_pool
+      client = make_client
 
       start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      status, = pool.request("GET", "/slow?delay=0.1", host_header)
+      status, = client.request(@server.endpoint, "GET", "/slow?delay=0.1", host_header)
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
 
       expect(status).to eq(200)
@@ -59,10 +59,10 @@ RSpec.describe TestServer do
     end
 
     it "supports duplicate response headers via X-Dup-Header" do
-      pool = make_pool
+      client = make_client
       headers = host_header + [["X-Dup-Header", "X-Multi:val1,val2,val3"]]
 
-      status, resp_headers = pool.request("GET", "/dup", headers)
+      status, resp_headers = client.request(@server.endpoint, "GET", "/dup", headers)
 
       expect(status).to eq(200)
       # resp_headers is an array of [name, value] pairs. The CRT may
@@ -78,9 +78,9 @@ RSpec.describe TestServer do
     end
 
     it "supports large response bodies via body_size query parameter" do
-      pool = make_pool
+      client = make_client
 
-      status, _, resp_body = pool.request(
+      status, _, resp_body = client.request(@server.endpoint, 
         "GET", "/large?body_size=65536", host_header
       )
 
@@ -89,18 +89,18 @@ RSpec.describe TestServer do
     end
 
     it "returns no body for HEAD requests" do
-      pool = make_pool
+      client = make_client
 
-      status, _, resp_body = pool.request("HEAD", "/head", host_header)
+      status, _, resp_body = client.request(@server.endpoint, "HEAD", "/head", host_header)
 
       expect(status).to eq(200)
       expect(resp_body).to eq("")
     end
 
     it "parses query parameters into the echo response" do
-      pool = make_pool
+      client = make_client
 
-      status, _, resp_body = pool.request(
+      status, _, resp_body = client.request(@server.endpoint, 
         "GET", "/search?q=hello&page=2", host_header
       )
 
@@ -124,12 +124,11 @@ RSpec.describe TestServer do
     end
 
     it "serves HTTPS requests when given the CA bundle" do
-      pool = AwsCrt::Http::ConnectionPool.new(
-        @server.endpoint,
+      client = AwsCrt::Http::Client.new(
         ssl_verify_peer: false
       )
 
-      status, _, resp_body = pool.request(
+      status, _, resp_body = client.request(@server.endpoint, 
         "GET", "/tls-test",
         [["Host", "127.0.0.1:#{@server.port}"]]
       )
