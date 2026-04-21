@@ -15,6 +15,8 @@ pub mod s3_request;
 pub mod s3_ruby;
 pub mod ractor_test;
 pub mod signing;
+pub mod signed_http_client;
+pub mod sigv4_signer;
 pub mod tls;
 
 // FFI bindings to the AWS CRT checksum C functions.
@@ -160,6 +162,12 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 
     // Ractor test struct (minimal frozen_shareable demo)
     ractor_test::define_ractor_test(ruby, &module)?;
+
+    // Sigv4 signer
+    sigv4_signer::define_sigv4_signer(ruby, &module)?;
+
+    // Combined signer + HTTP client
+    signed_http_client::define_signed_http_client(ruby, &module)?;
 
     Ok(())
 }

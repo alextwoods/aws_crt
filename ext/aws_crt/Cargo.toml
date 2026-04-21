@@ -14,3 +14,4 @@ magnus = { version = "0.8.2", features = ["rb-sys"] }
 rb-sys = { version = "0.9.126" }
 
 [build-dependencies]
+cc = "1"

@@ -106,4 +106,20 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CRT_INSTALL_DIR");
     println!("cargo:rerun-if-changed={}", lib_dir.display());
     println!("cargo:rerun-if-changed={}", include_dir.display());
+
+    // Compile the C helper for signing config initialization.
+    // This is needed because aws_signing_config_aws contains
+    // platform-dependent types (struct tm inside aws_date_time)
+    // that cannot be reliably replicated in Rust.
+    let c_src = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("src")
+        .join("signing_config_init.c");
+    if c_src.exists() {
+        cc::Build::new()
+            .file(&c_src)
+            .include(&include_dir)
+            .opt_level(2)
+            .compile("signing_config_init");
+        println!("cargo:rerun-if-changed={}", c_src.display());
+    }
 }

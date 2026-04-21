@@ -16,11 +16,11 @@ use crate::error::CrtError;
 use crate::runtime::AwsAllocator;
 
 // ---------------------------------------------------------------------------
-// Opaque CRT types
+// Opaque CRT types (pub for reuse by signed_http_client)
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-struct AwsHttpMessage {
+pub struct AwsHttpMessage {
     _opaque: [u8; 0],
 }
 
@@ -30,24 +30,24 @@ struct AwsHttpStream {
 }
 
 #[repr(C)]
-struct AwsInputStream {
+pub struct AwsInputStream {
     _opaque: [u8; 0],
 }
 
 // ---------------------------------------------------------------------------
-// FFI struct mirrors
+// FFI struct mirrors (pub for reuse by signed_http_client)
 // ---------------------------------------------------------------------------
 
 /// Mirrors `struct aws_byte_cursor`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AwsByteCursor {
-    len: usize,
-    ptr: *const u8,
+pub struct AwsByteCursor {
+    pub len: usize,
+    pub ptr: *const u8,
 }
 
 impl AwsByteCursor {
-    fn from_slice(s: &[u8]) -> Self {
+    pub fn from_slice(s: &[u8]) -> Self {
         Self {
             len: s.len(),
             ptr: s.as_ptr(),
@@ -57,11 +57,11 @@ impl AwsByteCursor {
 
 /// Mirrors `struct aws_http_header`.
 #[repr(C)]
-struct AwsHttpHeader {
-    name: AwsByteCursor,
-    value: AwsByteCursor,
-    compression: u32, // enum aws_http_header_compression
-    _pad: u32,
+pub struct AwsHttpHeader {
+    pub name: AwsByteCursor,
+    pub value: AwsByteCursor,
+    pub compression: u32, // enum aws_http_header_compression
+    pub _pad: u32,
 }
 
 /// Mirrors `struct aws_http_make_request_options`.
@@ -112,38 +112,38 @@ struct AwsHttpMakeRequestOptions {
 // ---------------------------------------------------------------------------
 
 extern "C" {
-    fn aws_default_allocator() -> *mut AwsAllocator;
+    pub fn aws_default_allocator() -> *mut AwsAllocator;
 
     // HTTP message construction
-    fn aws_http_message_new_request(
+    pub fn aws_http_message_new_request(
         allocator: *mut AwsAllocator,
     ) -> *mut AwsHttpMessage;
-    fn aws_http_message_release(
+    pub fn aws_http_message_release(
         message: *mut AwsHttpMessage,
     ) -> *mut AwsHttpMessage;
-    fn aws_http_message_set_request_method(
+    pub fn aws_http_message_set_request_method(
         message: *mut AwsHttpMessage,
         method: AwsByteCursor,
     ) -> i32;
-    fn aws_http_message_set_request_path(
+    pub fn aws_http_message_set_request_path(
         message: *mut AwsHttpMessage,
         path: AwsByteCursor,
     ) -> i32;
-    fn aws_http_message_add_header(
+    pub fn aws_http_message_add_header(
         message: *mut AwsHttpMessage,
         header: AwsHttpHeader,
     ) -> i32;
-    fn aws_http_message_set_body_stream(
+    pub fn aws_http_message_set_body_stream(
         message: *mut AwsHttpMessage,
         body_stream: *mut AwsInputStream,
     );
 
     // Input stream for request body
-    fn aws_input_stream_new_from_cursor(
+    pub fn aws_input_stream_new_from_cursor(
         allocator: *mut AwsAllocator,
         cursor: *const AwsByteCursor,
     ) -> *mut AwsInputStream;
-    fn aws_input_stream_release(stream: *mut AwsInputStream);
+    pub fn aws_input_stream_release(stream: *mut AwsInputStream);
 
     // Connection manager
     fn aws_http_connection_manager_acquire_connection(
@@ -620,6 +620,187 @@ pub struct HttpResponse {
     pub status_code: i32,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// Send a pre-built CRT HTTP request message on the given connection manager.
+///
+/// Unlike `make_request`, this function takes ownership of an already-built
+/// `AwsHttpMessage` (and optional body stream + body data) and sends it
+/// directly. This is used by the combined signer+client to avoid rebuilding
+/// the message after signing.
+///
+/// # Safety
+/// `request` must be a valid CRT HTTP message. `body_stream` must be a valid
+/// CRT input stream or null. `body_data` must be the backing storage for the
+/// body stream's cursor (if any).
+pub unsafe fn send_pre_built_request(
+    manager: *mut AwsHttpConnectionManager,
+    request: *mut AwsHttpMessage,
+    body_stream: *mut AwsInputStream,
+    body_data: Option<Vec<u8>>,
+    read_timeout_ms: u64,
+) -> Result<HttpResponse, CrtError> {
+    // Set up shared state
+    let state: SharedState = Arc::new((
+        Mutex::new(RequestState {
+            status_code: 0,
+            headers: Vec::new(),
+            body: Vec::new(),
+            chunks: VecDeque::new(),
+            streaming: false,
+            error_code: 0,
+            complete: false,
+            connection: std::ptr::null_mut(),
+            manager,
+        }),
+        Condvar::new(),
+    ));
+
+    let ctx = Box::new(RequestContext {
+        state: Arc::clone(&state),
+        request,
+        body_stream,
+        _body_data: body_data,
+        response_first_byte_timeout_ms: read_timeout_ms,
+    });
+    let ctx_ptr = Box::into_raw(ctx);
+
+    // Acquire a connection — this is async, the callback fires the request
+    aws_http_connection_manager_acquire_connection(
+        manager,
+        on_connection_acquired_with_ctx,
+        ctx_ptr as *mut std::ffi::c_void,
+    );
+
+    // Release the GVL and wait for the request to complete
+    let wait_data = WaitData {
+        state: Arc::clone(&state),
+    };
+    rb_thread_call_without_gvl(
+        wait_for_completion,
+        &wait_data as *const WaitData as *mut std::ffi::c_void,
+        std::ptr::null(),
+        std::ptr::null(),
+    );
+
+    // Clean up the request context
+    cleanup_request_context(ctx_ptr);
+
+    // Extract the result
+    let mut guard = state.0.lock().unwrap();
+    if guard.error_code != 0 {
+        return Err(CrtError::from_code(guard.error_code));
+    }
+
+    Ok(HttpResponse {
+        status_code: guard.status_code,
+        headers: std::mem::take(&mut guard.headers),
+        body: std::mem::take(&mut guard.body),
+    })
+}
+
+/// Send a pre-built CRT HTTP request message with streaming response.
+///
+/// Like `send_pre_built_request` but yields response body chunks to callbacks
+/// instead of buffering the entire response.
+///
+/// # Safety
+/// Same requirements as `send_pre_built_request`.
+pub unsafe fn send_pre_built_streaming_request<H, F>(
+    manager: *mut AwsHttpConnectionManager,
+    request: *mut AwsHttpMessage,
+    body_stream: *mut AwsInputStream,
+    body_data: Option<Vec<u8>>,
+    read_timeout_ms: u64,
+    mut on_headers: H,
+    mut on_chunk: F,
+) -> Result<(), CrtError>
+where
+    H: FnMut(i32, &[(String, String)]),
+    F: FnMut(&[u8]),
+{
+    // Set up shared state
+    let state: SharedState = Arc::new((
+        Mutex::new(RequestState {
+            status_code: 0,
+            headers: Vec::new(),
+            body: Vec::new(),
+            chunks: VecDeque::new(),
+            streaming: true,
+            error_code: 0,
+            complete: false,
+            connection: std::ptr::null_mut(),
+            manager,
+        }),
+        Condvar::new(),
+    ));
+
+    let ctx = Box::new(RequestContext {
+        state: Arc::clone(&state),
+        request,
+        body_stream,
+        _body_data: body_data,
+        response_first_byte_timeout_ms: read_timeout_ms,
+    });
+    let ctx_ptr = Box::into_raw(ctx);
+
+    // Acquire a connection
+    aws_http_connection_manager_acquire_connection(
+        manager,
+        on_connection_acquired_with_ctx,
+        ctx_ptr as *mut std::ffi::c_void,
+    );
+
+    // Streaming loop
+    let wait_data = WaitData {
+        state: Arc::clone(&state),
+    };
+
+    let mut headers_delivered = false;
+
+    loop {
+        rb_thread_call_without_gvl(
+            wait_for_chunk_or_completion,
+            &wait_data as *const WaitData as *mut std::ffi::c_void,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+
+        let (status_code, resp_headers, chunks, complete, error_code) = {
+            let mut guard = state.0.lock().unwrap();
+            let chunks: Vec<Vec<u8>> = guard.chunks.drain(..).collect();
+            (
+                guard.status_code,
+                guard.headers.clone(),
+                chunks,
+                guard.complete,
+                guard.error_code,
+            )
+        };
+
+        if !headers_delivered && status_code > 0 {
+            on_headers(status_code, &resp_headers);
+            headers_delivered = true;
+        }
+
+        for chunk in &chunks {
+            on_chunk(chunk);
+        }
+
+        if complete {
+            cleanup_request_context(ctx_ptr);
+
+            if error_code != 0 {
+                return Err(CrtError::from_code(error_code));
+            }
+
+            if !headers_delivered && status_code > 0 {
+                on_headers(status_code, &resp_headers);
+            }
+
+            return Ok(());
+        }
+    }
 }
 
 /// Execute a buffered HTTP request on the given connection manager.
