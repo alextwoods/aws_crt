@@ -13,10 +13,111 @@ use rb_sys::{
 
 extern "C" {
     fn rb_float_new(d: f64) -> VALUE;
+    fn rb_enc_interned_str(ptr: *const std::ffi::c_char, len: c_long, enc: *mut rb_sys::rb_encoding) -> VALUE;
+    fn rb_hash_bulk_insert(argc: c_long, argv: *const VALUE, hash: VALUE);
 }
 use std::cell::{Cell, RefCell};
 use std::ffi::c_int;
 use std::os::raw::c_long;
+
+// ---------------------------------------------------------------------------
+// String interning cache — inspired by Ruby JSON's rvalue_cache.
+// Map keys repeat heavily in real-world data (e.g. 100 items each with
+// "id", "name", "tags", …). Caching the interned Ruby string for each
+// unique key avoids repeated allocation + GC pressure.
+// Binary-search into a sorted array keeps the cache compact and fast.
+// ---------------------------------------------------------------------------
+
+const KEY_CACHE_CAPA: usize = 63;
+const KEY_CACHE_MAX_LEN: usize = 55;
+
+struct KeyCache {
+    len: usize,
+    entries: [VALUE; KEY_CACHE_CAPA],
+}
+
+impl KeyCache {
+    #[inline(always)]
+    fn new() -> Self {
+        KeyCache {
+            len: 0,
+            entries: [0; KEY_CACHE_CAPA],
+        }
+    }
+
+    /// Look up or insert an interned string for the given bytes.
+    #[inline]
+    fn fetch(&mut self, bytes: &[u8]) -> VALUE {
+        // Only cache short, likely-repeated keys
+        if bytes.len() > KEY_CACHE_MAX_LEN || bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+            return self.intern_string(bytes);
+        }
+
+        // Binary search
+        let mut low: isize = 0;
+        let mut high: isize = self.len as isize - 1;
+
+        while low <= high {
+            let mid = ((low + high) >> 1) as usize;
+            let entry = self.entries[mid];
+            let cmp = self.cmp_entry(bytes, entry);
+            if cmp == 0 {
+                return entry;
+            } else if cmp > 0 {
+                low = mid as isize + 1;
+            } else {
+                high = mid as isize - 1;
+            }
+        }
+
+        let interned = self.intern_string(bytes);
+
+        if self.len < KEY_CACHE_CAPA {
+            let insert_at = low as usize;
+            // Shift entries right to make room
+            if insert_at < self.len {
+                unsafe {
+                    std::ptr::copy(
+                        self.entries.as_ptr().add(insert_at),
+                        self.entries.as_mut_ptr().add(insert_at + 1),
+                        self.len - insert_at,
+                    );
+                }
+            }
+            self.entries[insert_at] = interned;
+            self.len += 1;
+        }
+
+        interned
+    }
+
+    #[inline(always)]
+    fn cmp_entry(&self, bytes: &[u8], entry: VALUE) -> i32 {
+        let (eptr, elen) = unsafe { rstring_ptr_len(entry) };
+        let entry_bytes = unsafe { std::slice::from_raw_parts(eptr, elen) };
+        if bytes.len() != entry_bytes.len() {
+            return (bytes.len() as i32) - (entry_bytes.len() as i32);
+        }
+        // Compare bytes directly — both are short
+        for i in 0..bytes.len() {
+            if bytes[i] != entry_bytes[i] {
+                return (bytes[i] as i32) - (entry_bytes[i] as i32);
+            }
+        }
+        0
+    }
+
+    #[inline(always)]
+    fn intern_string(&self, bytes: &[u8]) -> VALUE {
+        unsafe {
+            rb_enc_interned_str(
+                bytes.as_ptr() as *const std::ffi::c_char,
+                bytes.len() as c_long,
+                rb_sys::rb_enc_from_index(UTF8_ENCINDEX),
+            )
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Cached class references – set once during init(), read on every encode/decode
@@ -194,16 +295,17 @@ fn write_head(buf: &mut Vec<u8>, major: u8, value: u64) {
     match value {
         0..=23 => buf.push(major | value as u8),
         24..=0xff => {
+            // 2 bytes: push individually to avoid slice overhead
             buf.push(major | 24);
             buf.push(value as u8);
         }
         0x100..=0xffff => {
-            buf.push(major | 25);
-            buf.extend_from_slice(&(value as u16).to_be_bytes());
+            let v = (value as u16).to_be_bytes();
+            buf.extend_from_slice(&[major | 25, v[0], v[1]]);
         }
         0x1_0000..=0xffff_ffff => {
-            buf.push(major | 26);
-            buf.extend_from_slice(&(value as u32).to_be_bytes());
+            let v = (value as u32).to_be_bytes();
+            buf.extend_from_slice(&[major | 26, v[0], v[1], v[2], v[3]]);
         }
         _ => {
             buf.push(major | 27);
@@ -223,8 +325,16 @@ fn encode_integer(buf: &mut Vec<u8>, val: i128) {
 
 #[inline(always)]
 fn encode_text(buf: &mut Vec<u8>, bytes: &[u8]) {
-    write_head(buf, MAJOR_TEXT, bytes.len() as u64);
-    buf.extend_from_slice(bytes);
+    let len = bytes.len();
+    if len <= 23 {
+        // Single-byte head + body — reserve once, write together
+        buf.reserve(1 + len);
+        buf.push(MAJOR_TEXT | len as u8);
+        buf.extend_from_slice(bytes);
+    } else {
+        write_head(buf, MAJOR_TEXT, len as u64);
+        buf.extend_from_slice(bytes);
+    }
 }
 
 #[inline(always)]
@@ -343,10 +453,12 @@ fn encode_value(ruby: &Ruby, buf: &mut Vec<u8>, raw: VALUE) -> Result<(), Error>
             let (ptr, len) = rstring_ptr_len(raw);
             let enc_idx = string_enc_index(raw);
             let bytes = std::slice::from_raw_parts(ptr, len);
-            if enc_idx == BINARY_ENCINDEX {
-                write_head(buf, MAJOR_BYTES, len as u64);
+            let major = if enc_idx == BINARY_ENCINDEX { MAJOR_BYTES } else { MAJOR_TEXT };
+            if len <= 23 {
+                buf.reserve(1 + len);
+                buf.push(major | len as u8);
             } else {
-                write_head(buf, MAJOR_TEXT, len as u64);
+                write_head(buf, major, len as u64);
             }
             buf.extend_from_slice(bytes);
             Ok(())
@@ -548,108 +660,11 @@ fn dec_read_count(ruby: &Ruby, data: &[u8], pos: &mut usize, ai: u8) -> Result<u
 }
 
 fn decode_value(ruby: &Ruby, data: &[u8], pos: &mut usize) -> Result<VALUE, Error> {
-    let p = *pos;
-    if p >= data.len() {
-        return Err(Error::new(
-            out_of_bytes_error(ruby),
-            format!(
-                "Out of bytes. Trying to read 1 bytes but buffer contains only {}",
-                data.len() as isize - p as isize
-            ),
-        ));
-    }
-    let ib = data[p];
-    let major = ib >> 5;
-    let add_info = ib & 0x1f;
-
-    match major {
-        // Fast path for small unsigned integers (0..23) — very common
-        0 if add_info < 24 => {
-            *pos = p + 1;
-            Ok(fixnum_val(add_info as i64))
-        }
-        // Fast path for small negative integers (-1..-24)
-        1 if add_info < 24 => {
-            *pos = p + 1;
-            Ok(fixnum_val(-1 - add_info as i64))
-        }
-        0 | 1 => decode_integer_raw(ruby, data, pos),
-        2 if add_info == 31 => decode_indef_binary(ruby, data, pos),
-        2 => decode_binary_raw(ruby, data, pos),
-        3 if add_info == 31 => decode_indef_text(ruby, data, pos),
-        3 => decode_text_raw(ruby, data, pos),
-        4 if add_info == 31 => decode_indef_array(ruby, data, pos),
-        4 => decode_array_raw(ruby, data, pos),
-        5 if add_info == 31 => decode_indef_map(ruby, data, pos),
-        5 => decode_map_raw(ruby, data, pos),
-        6 => decode_tag_raw(ruby, data, pos),
-        7 => match add_info {
-            20 => {
-                *pos = p + 1;
-                Ok(rb_sys::Qfalse as VALUE)
-            }
-            21 => {
-                *pos = p + 1;
-                Ok(rb_sys::Qtrue as VALUE)
-            }
-            22 => {
-                *pos = p + 1;
-                Ok(rb_sys::Qnil as VALUE)
-            }
-            23 => {
-                *pos = p + 1;
-                Ok(Symbol::new("undefined").as_value().as_raw())
-            }
-            25 => decode_half_raw(ruby, data, pos),
-            26 => {
-                let start = p + 1;
-                let end = start + 4;
-                if end > data.len() {
-                    return Err(Error::new(
-                        out_of_bytes_error(ruby),
-                        format!(
-                            "Out of bytes. Trying to read 4 bytes but buffer contains only {}",
-                            data.len() as isize - start as isize
-                        ),
-                    ));
-                }
-                let f = f32::from_be_bytes([data[start], data[start+1], data[start+2], data[start+3]]);
-                *pos = end;
-                Ok(unsafe { rb_float_new(f as f64) })
-            }
-            27 => {
-                let start = p + 1;
-                let end = start + 8;
-                if end > data.len() {
-                    return Err(Error::new(
-                        out_of_bytes_error(ruby),
-                        format!(
-                            "Out of bytes. Trying to read 8 bytes but buffer contains only {}",
-                            data.len() as isize - start as isize
-                        ),
-                    ));
-                }
-                let f = f64::from_be_bytes([
-                    data[start], data[start+1], data[start+2], data[start+3],
-                    data[start+4], data[start+5], data[start+6], data[start+7],
-                ]);
-                *pos = end;
-                Ok(unsafe { rb_float_new(f) })
-            }
-            31 => Err(Error::new(
-                unexpected_break_code_error(ruby),
-                "Unexpected break stop code",
-            )),
-            _ => {
-                *pos = p + 1;
-                Err(Error::new(
-                    cbor_error(ruby),
-                    format!("Undefined reserved additional information: {}", add_info),
-                ))
-            }
-        },
-        _ => unreachable!(),
-    }
+    // Create a key cache and delegate to the cached version.
+    // The cache is shared across the entire decode tree, so repeated
+    // map keys (e.g. "id", "name", "tags" across 100 items) are interned once.
+    let mut cache = KeyCache::new();
+    decode_value_cached(ruby, data, pos, &mut cache)
 }
 
 #[inline]
@@ -721,68 +736,75 @@ fn decode_text_raw(ruby: &Ruby, data: &[u8], pos: &mut usize) -> Result<VALUE, E
     Ok(unsafe { new_encoded_string(bytes, UTF8_ENCINDEX) })
 }
 
-fn decode_array_raw(ruby: &Ruby, data: &[u8], pos: &mut usize) -> Result<VALUE, Error> {
-    let (_mt, ai) = dec_read_info(ruby, data, pos)?;
-    let len = dec_read_count(ruby, data, pos, ai)? as usize;
-    let arr = unsafe { rb_sys::rb_ary_new_capa(len as c_long) };
-    for _ in 0..len {
-        let item = decode_value(ruby, data, pos)?;
-        unsafe { rb_ary_push(arr, item) };
-    }
-    Ok(arr)
-}
+// (decode_array_raw removed — superseded by decode_array_raw_cached)
+// (decode_map_raw removed — superseded by decode_map_raw_cached)
 
-fn decode_map_raw(ruby: &Ruby, data: &[u8], pos: &mut usize) -> Result<VALUE, Error> {
+/// Decode a definite-length map, sharing a key cache across nested maps.
+fn decode_map_raw_cached(
+    ruby: &Ruby,
+    data: &[u8],
+    pos: &mut usize,
+    cache: &mut KeyCache,
+) -> Result<VALUE, Error> {
     let (_mt, ai) = dec_read_info(ruby, data, pos)?;
     let len = dec_read_count(ruby, data, pos, ai)? as usize;
     let hash = unsafe { rb_sys::rb_hash_new_capa(len as c_long) };
-    for _ in 0..len {
-        // Inline key decode: most keys are short text (major 3, ai < 24)
-        let key;
-        let p = *pos;
-        if p < data.len() {
-            let ib = data[p];
-            let kai = ib & 0x1f;
-            if (ib >> 5) == 3 && kai < 24 {
-                let slen = kai as usize;
-                let start = p + 1;
-                let end = start + slen;
-                if end <= data.len() {
-                    *pos = end;
-                    key = unsafe {
-                        new_encoded_string(&data[start..end], UTF8_ENCINDEX)
-                    };
-                } else {
-                    key = decode_text_raw(ruby, data, pos)?;
-                }
-            } else {
-                key = decode_text_raw(ruby, data, pos)?;
-            }
-        } else {
-            key = decode_text_raw(ruby, data, pos)?;
+
+    // For small maps, use a stack-allocated pairs buffer + bulk insert.
+    // 32 pairs = 64 VALUEs = 512 bytes on the stack — covers most real payloads.
+    const BULK_THRESHOLD: usize = 32;
+    if len <= BULK_THRESHOLD {
+        let mut pairs: [VALUE; BULK_THRESHOLD * 2] = [0; BULK_THRESHOLD * 2];
+        for i in 0..len {
+            pairs[i * 2] = decode_map_key_cached(ruby, data, pos, cache)?;
+            pairs[i * 2 + 1] = decode_value_cached(ruby, data, pos, cache)?;
         }
-        let val = decode_value(ruby, data, pos)?;
-        unsafe { rb_hash_aset(hash, key, val) };
+        unsafe { rb_hash_bulk_insert(len as c_long * 2, pairs.as_ptr(), hash) };
+    } else {
+        for _ in 0..len {
+            let key = decode_map_key_cached(ruby, data, pos, cache)?;
+            let val = decode_value_cached(ruby, data, pos, cache)?;
+            unsafe { rb_hash_aset(hash, key, val) };
+        }
     }
     Ok(hash)
 }
 
-fn decode_indef_array(ruby: &Ruby, data: &[u8], pos: &mut usize) -> Result<VALUE, Error> {
-    *pos += 1; // skip initial byte (0x9f)
-    let arr = unsafe { rb_sys::rb_ary_new() };
-    loop {
-        let ib = dec_peek(ruby, data, *pos)?;
-        if ib == 0xff {
-            *pos += 1;
-            break;
+/// Decode a map key, using the interning cache for short text keys.
+#[inline]
+fn decode_map_key_cached(
+    ruby: &Ruby,
+    data: &[u8],
+    pos: &mut usize,
+    cache: &mut KeyCache,
+) -> Result<VALUE, Error> {
+    let p = *pos;
+    if p < data.len() {
+        let ib = data[p];
+        let kai = ib & 0x1f;
+        if (ib >> 5) == 3 && kai < 24 {
+            let slen = kai as usize;
+            let start = p + 1;
+            let end = start + slen;
+            if end <= data.len() {
+                *pos = end;
+                return Ok(cache.fetch(&data[start..end]));
+            }
         }
-        let item = decode_value(ruby, data, pos)?;
-        unsafe { rb_ary_push(arr, item) };
     }
-    Ok(arr)
+    // Fallback: non-short-text key or longer text key
+    decode_value_cached(ruby, data, pos, cache)
 }
 
-fn decode_indef_map(ruby: &Ruby, data: &[u8], pos: &mut usize) -> Result<VALUE, Error> {
+// (decode_indef_array removed — superseded by decode_indef_array_cached)
+// (decode_indef_map removed — superseded by decode_indef_map_cached)
+
+fn decode_indef_map_cached(
+    ruby: &Ruby,
+    data: &[u8],
+    pos: &mut usize,
+    cache: &mut KeyCache,
+) -> Result<VALUE, Error> {
     *pos += 1;
     let hash = unsafe { rb_sys::rb_hash_new() };
     loop {
@@ -791,32 +813,143 @@ fn decode_indef_map(ruby: &Ruby, data: &[u8], pos: &mut usize) -> Result<VALUE, 
             *pos += 1;
             break;
         }
-        // Inline short text key decode (major 3, ai < 24)
-        let key;
-        let p = *pos;
-        if p < data.len() {
-            let b = data[p];
-            let kai = b & 0x1f;
-            if (b >> 5) == 3 && kai < 24 {
-                let slen = kai as usize;
-                let start = p + 1;
-                let end = start + slen;
-                if end <= data.len() {
-                    *pos = end;
-                    key = unsafe { new_encoded_string(&data[start..end], UTF8_ENCINDEX) };
-                } else {
-                    key = decode_text_raw(ruby, data, pos)?;
-                }
-            } else {
-                key = decode_text_raw(ruby, data, pos)?;
-            }
-        } else {
-            key = decode_text_raw(ruby, data, pos)?;
-        }
-        let val = decode_value(ruby, data, pos)?;
+        let key = decode_map_key_cached(ruby, data, pos, cache)?;
+        let val = decode_value_cached(ruby, data, pos, cache)?;
         unsafe { rb_hash_aset(hash, key, val) };
     }
     Ok(hash)
+}
+
+/// Like `decode_value` but threads a KeyCache through nested maps/arrays.
+/// This is the hot path for decoding — the cache reduces GC pressure by
+/// reusing interned strings for repeated map keys.
+fn decode_value_cached(ruby: &Ruby, data: &[u8], pos: &mut usize, cache: &mut KeyCache) -> Result<VALUE, Error> {
+    let p = *pos;
+    if p >= data.len() {
+        return Err(Error::new(
+            out_of_bytes_error(ruby),
+            format!(
+                "Out of bytes. Trying to read 1 bytes but buffer contains only {}",
+                data.len() as isize - p as isize
+            ),
+        ));
+    }
+    let ib = data[p];
+    let major = ib >> 5;
+    let add_info = ib & 0x1f;
+
+    match major {
+        0 if add_info < 24 => {
+            *pos = p + 1;
+            Ok(fixnum_val(add_info as i64))
+        }
+        1 if add_info < 24 => {
+            *pos = p + 1;
+            Ok(fixnum_val(-1 - add_info as i64))
+        }
+        0 | 1 => decode_integer_raw(ruby, data, pos),
+        2 if add_info == 31 => decode_indef_binary(ruby, data, pos),
+        2 => decode_binary_raw(ruby, data, pos),
+        3 if add_info == 31 => decode_indef_text(ruby, data, pos),
+        3 => decode_text_raw(ruby, data, pos),
+        4 if add_info == 31 => decode_indef_array_cached(ruby, data, pos, cache),
+        4 => decode_array_raw_cached(ruby, data, pos, cache),
+        5 if add_info == 31 => decode_indef_map_cached(ruby, data, pos, cache),
+        5 => decode_map_raw_cached(ruby, data, pos, cache),
+        6 => decode_tag_raw(ruby, data, pos),
+        7 => match add_info {
+            20 => {
+                *pos = p + 1;
+                Ok(rb_sys::Qfalse as VALUE)
+            }
+            21 => {
+                *pos = p + 1;
+                Ok(rb_sys::Qtrue as VALUE)
+            }
+            22 => {
+                *pos = p + 1;
+                Ok(rb_sys::Qnil as VALUE)
+            }
+            23 => {
+                *pos = p + 1;
+                Ok(Symbol::new("undefined").as_value().as_raw())
+            }
+            25 => decode_half_raw(ruby, data, pos),
+            26 => {
+                let start = p + 1;
+                let end = start + 4;
+                if end > data.len() {
+                    return Err(Error::new(
+                        out_of_bytes_error(ruby),
+                        format!(
+                            "Out of bytes. Trying to read 4 bytes but buffer contains only {}",
+                            data.len() as isize - start as isize
+                        ),
+                    ));
+                }
+                let f = f32::from_be_bytes([data[start], data[start+1], data[start+2], data[start+3]]);
+                *pos = end;
+                Ok(unsafe { rb_float_new(f as f64) })
+            }
+            27 => {
+                let start = p + 1;
+                let end = start + 8;
+                if end > data.len() {
+                    return Err(Error::new(
+                        out_of_bytes_error(ruby),
+                        format!(
+                            "Out of bytes. Trying to read 8 bytes but buffer contains only {}",
+                            data.len() as isize - start as isize
+                        ),
+                    ));
+                }
+                let f = f64::from_be_bytes([
+                    data[start], data[start+1], data[start+2], data[start+3],
+                    data[start+4], data[start+5], data[start+6], data[start+7],
+                ]);
+                *pos = end;
+                Ok(unsafe { rb_float_new(f) })
+            }
+            31 => Err(Error::new(
+                unexpected_break_code_error(ruby),
+                "Unexpected break stop code",
+            )),
+            _ => {
+                *pos = p + 1;
+                Err(Error::new(
+                    cbor_error(ruby),
+                    format!("Undefined reserved additional information: {}", add_info),
+                ))
+            }
+        },
+        _ => unreachable!(),
+    }
+}
+
+fn decode_array_raw_cached(ruby: &Ruby, data: &[u8], pos: &mut usize, cache: &mut KeyCache) -> Result<VALUE, Error> {
+    let (_mt, ai) = dec_read_info(ruby, data, pos)?;
+    let len = dec_read_count(ruby, data, pos, ai)? as usize;
+    let arr = unsafe { rb_sys::rb_ary_new_capa(len as c_long) };
+    for _ in 0..len {
+        let item = decode_value_cached(ruby, data, pos, cache)?;
+        unsafe { rb_ary_push(arr, item) };
+    }
+    Ok(arr)
+}
+
+fn decode_indef_array_cached(ruby: &Ruby, data: &[u8], pos: &mut usize, cache: &mut KeyCache) -> Result<VALUE, Error> {
+    *pos += 1; // skip initial byte (0x9f)
+    let arr = unsafe { rb_sys::rb_ary_new() };
+    loop {
+        let ib = dec_peek(ruby, data, *pos)?;
+        if ib == 0xff {
+            *pos += 1;
+            break;
+        }
+        let item = decode_value_cached(ruby, data, pos, cache)?;
+        unsafe { rb_ary_push(arr, item) };
+    }
+    Ok(arr)
 }
 
 fn decode_indef_binary(ruby: &Ruby, data: &[u8], pos: &mut usize) -> Result<VALUE, Error> {

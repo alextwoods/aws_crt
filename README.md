@@ -157,7 +157,10 @@ libraries, then Cargo compiles the Rust extension and statically links them.
 ## CBOR Performance
 
 The CBOR encoder and decoder are optimized for minimal overhead on the
-Ruby-to-Rust boundary. Key optimizations:
+Ruby-to-Rust boundary. Several techniques are borrowed from Ruby's own
+[JSON native extension](https://github.com/ruby/json) (the `rvalue_cache`,
+`rb_hash_bulk_insert`, and `rb_enc_interned_str` patterns) and adapted for
+the CBOR format.
 
 ### Encoding
 
@@ -175,9 +178,23 @@ Ruby-to-Rust boundary. Key optimizations:
 - **Auto float precision** — Floats that can be represented exactly as
   single-precision are encoded as 4 bytes instead of 8, matching the CBOR
   gem's behavior and reducing output size.
+- **Combined head+body writes** — For short strings (≤23 bytes), the CBOR
+  header byte and string body are written with a single reserve+extend,
+  reducing per-string overhead.
 
 ### Decoding
 
+- **String interning cache for map keys** — Inspired by the JSON parser's
+  `rvalue_cache`, a sorted-array cache with binary search (capacity 63,
+  max key length 55 bytes) deduplicates repeated map keys using
+  `rb_enc_interned_str`. In real-world payloads where the same keys
+  ("id", "name", "tags", …) appear across hundreds of array items, each
+  unique key is allocated once and reused — dramatically reducing GC
+  pressure. The cache is shared across the entire decode tree so nested
+  maps and arrays all benefit.
+- **Bulk hash insertion** — For maps with ≤32 entries, key-value pairs are
+  collected into a stack-allocated array and inserted via
+  `rb_hash_bulk_insert`, avoiding per-pair `rb_hash_aset` overhead.
 - **Inlined fast paths** — Small integers (0–23, -1–-24) and short text
   strings (length < 24) are decoded inline in the main dispatch loop,
   avoiding function call overhead for the most common CBOR types.
@@ -187,13 +204,10 @@ Ruby-to-Rust boundary. Key optimizations:
 - **Direct Ruby object creation** — Uses `rb_float_new`, `LONG2FIX`,
   `rb_enc_str_new`, `rb_ary_new_capa`, `rb_hash_new_capa`, and
   `rb_hash_aset` directly, bypassing magnus value conversion.
-- **Inlined map key decode** — Hash keys (typically short text strings) are
-  decoded inline in the map decode loop, avoiding a function call per
-  key-value pair.
 
 ### Benchmark results
 
-Measured on Apple M3 Pro, Ruby 3.3.3, comparing against the
+Measured on Apple M3 Pro, Ruby 4.0.0, comparing against the
 [cbor](https://rubygems.org/gems/cbor) C extension gem and Ruby's built-in
 JSON:
 
@@ -201,22 +215,32 @@ JSON:
 
 | Payload | AwsCrt::Cbor.encode | CBOR gem (C) | JSON.dump | Aws::Cbor (pure Ruby) |
 |---------|--------------------:|-------------:|----------:|----------------------:|
-| Small (3-key int map) | 6.67M | 4.49M | 4.43M | 317k |
-| Medium (50-key string map) | 618k | 722k | 608k | 23k |
-| Large (nested mixed) | 45.2k | 47.8k | 44.3k | 1.3k |
+| Small (3-key int map) | 6.95M | 4.76M | 4.33M | 376k |
+| Medium (50-key string map) | 663k | 659k | 573k | 21k |
+| Large (nested mixed) | 46.9k | 47.2k | 41.5k | 1.3k |
 
 **Decode** (iterations/second, higher is better):
 
 | Payload | AwsCrt::Cbor.decode | CBOR gem (C) | JSON.parse | Aws::Cbor (pure Ruby) |
 |---------|--------------------:|-------------:|-----------:|----------------------:|
-| Small (3-key int map) | 3.45M | 2.45M | 3.97M | 260k |
-| Medium (50-key string map) | 150k | 148k | 210k | 17k |
-| Large (nested mixed) | 10.5k | 12.7k | 21.8k | 809 |
+| Small (3-key int map) | 5.40M | 2.54M | 4.12M | 249k |
+| Medium (50-key string map) | 174k | 172k | 212k | 16k |
+| Large (nested mixed) | 25.0k | 12.5k | 23.8k | 796 |
 
 Encoding is 1.5x faster than the CBOR C gem on small payloads and
-competitive on larger ones. Decoding consistently beats the CBOR C gem and
-is within 1.2–2x of JSON (which benefits from a monolithic C state machine
-parser with less per-value function dispatch overhead).
+competitive on larger ones. Decoding beats the CBOR C gem by 2x on both
+small and large payloads, and matches or exceeds JSON on small and large
+payloads. The string interning cache is the key differentiator on large
+payloads — where repeated map keys across 100+ array items are interned
+once instead of allocated per-item, cutting GC overhead significantly.
+
+**Wire size** — CBOR also produces smaller payloads than JSON (no key
+quoting, no delimiters, binary integer/float encoding):
+
+| Payload | CBOR bytes | JSON bytes | Savings |
+|---------|----------:|----------:|---------:|
+| Medium (50-key string map) | 2,392 | 2,541 | 6% |
+| Large (nested mixed) | 10,937 | 14,563 | 25% |
 
 ## Prerequisites
 
