@@ -8,7 +8,10 @@ This gem provides:
 - **CRC Checksums** — Hardware-accelerated CRC32, CRC32C, and CRC64-NVME via the CRT (SSE4.2, AVX-512, CLMUL, ARM CRC, ARM PMULL) with efficient software fallbacks.
 - **CBOR Encoder/Decoder** — A fast CBOR (RFC 8949) encoder and decoder implemented in Rust, compatible with the `Aws::Cbor` interface from `aws-sdk-core`.
 - **HTTP Client** — A CRT-backed HTTP/1.1 client with connection pooling, TLS, proxy support, and streaming responses. Drop-in replacement for the default `Net::HTTP` handler in the AWS SDK for Ruby V3.
+- **SigV4 Signer** — A standalone CRT-backed SigV4 request signer. The entire signing operation (canonical request, string-to-sign, signature, header injection) happens in native code with the GVL released during the async CRT signing callback.
+- **Signed HTTP Client** — A combined signer + HTTP client that signs and sends requests in a single native call. Avoids crossing the Ruby/Rust boundary twice, eliminating intermediate type conversions and an extra GVL release/acquire cycle.
 - **S3 Client** — A standalone high-performance S3 client backed by the CRT's `aws-c-s3` meta-request system. Provides automatic request splitting (parallel multipart upload/download), per-chunk retries, and parallel file I/O for significantly higher throughput on large object transfers.
+- **Ractor Support** — The HTTP client, signed HTTP client, and other key types are Ractor-shareable when frozen, enabling true parallel execution across Ruby 4 Ractors.
 
 The native extension is written in Rust (using [magnus](https://github.com/matsadler/magnus)
 and [rb_sys](https://github.com/oxidize-rb/rb-sys)) and calls directly into
@@ -23,6 +26,8 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 │  AwsCrt::Cbor.encode(data)                              │
 │  Aws::S3::Client.new  (with CRT HTTP handler)           │
 │  AwsCrt::S3::Client.new  (standalone CRT S3 client)     │
+│  AwsCrt::Sigv4Signer.new  (standalone SigV4 signer)     │
+│  AwsCrt::SignedHttpClient.new  (sign + send in one call) │
 └──────────────────────────┬──────────────────────────────┘
                            │
 ┌──────────────────────────▼──────────────────────────────┐
@@ -30,8 +35,8 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 │  lib/aws_crt/http/handler.rb     Seahorse :send handler  │
 │  lib/aws_crt/http/plugin.rb      SDK plugin + config     │
 │  lib/aws_crt/http/patcher.rb     auto-patch on require   │
-│  lib/aws_crt/http/connection_pool_manager.rb             │
-│  lib/aws_crt/http/connection_pool.rb                     │
+│  lib/aws_crt/sigv4_signer.rb    SigV4 signer wrapper     │
+│  lib/aws_crt/signed_http_client.rb  combined sign+send   │
 │  lib/aws_crt/s3/client.rb        S3 client wrapper       │
 │  lib/aws_crt/s3/response.rb      S3 response object      │
 │  lib/aws_crt/s3/errors.rb        S3 error hierarchy      │
@@ -42,16 +47,18 @@ the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 │  src/lib.rs               entry point + checksum FFI     │
 │  src/cbor.rs              CBOR encode/decode             │
 │  src/http.rs              request/response execution     │
+│  src/http_client.rs       Ruby-facing HTTP client class  │
 │  src/connection_manager.rs  CRT connection pool wrapper  │
+│  src/sigv4_signer.rs      SigV4 signing (standalone)     │
+│  src/signed_http_client.rs  combined sign + send         │
 │  src/s3_client.rs         CRT S3 client wrapper          │
 │  src/s3_request.rs        S3 meta-request execution      │
 │  src/s3_ruby.rs           Ruby-facing S3 class           │
 │  src/credentials.rs       CRT credentials bridge         │
-│  src/signing.rs           CRT signing config             │
+│  src/signing.rs           CRT signing config (S3)        │
 │  src/runtime.rs           shared CRT resources (once)    │
 │  src/tls.rs               TLS context management         │
 │  src/proxy.rs             proxy configuration            │
-│  src/pool.rs              Ruby-facing pool class          │
 │  src/error.rs             CRT → Ruby error translation   │
 └──────────────────────────┬──────────────────────────────┘
                            │  extern "C" / calls
@@ -130,9 +137,11 @@ The build is driven by cmake and orchestrated through Rake:
    between Ruby and Rust. The Rust code declares `extern "C"` bindings to
    CRT checksum functions (in `src/lib.rs`), CRT HTTP APIs (in `src/http.rs`,
    `src/connection_manager.rs`, `src/runtime.rs`, `src/tls.rs`, `src/proxy.rs`),
-   and CRT S3 APIs (in `src/s3_client.rs`, `src/s3_request.rs`,
-   `src/credentials.rs`, `src/signing.rs`). Both the HTTP and S3 paths release
-   the GVL during blocking I/O so other Ruby threads can run concurrently.
+   CRT signing APIs (in `src/sigv4_signer.rs`, `src/signed_http_client.rs`,
+   `src/credentials.rs`), and CRT S3 APIs (in `src/s3_client.rs`,
+   `src/s3_request.rs`, `src/signing.rs`). The HTTP, signing, and S3 paths
+   all release the GVL during blocking I/O so other Ruby threads can run
+   concurrently.
 
 ### How they're included in the gem
 
@@ -480,18 +489,29 @@ The plugin accepts the same options as the SDK's default HTTP handler:
 | `max_connections` | 25 | Max concurrent connections per endpoint |
 | `max_connection_idle_ms` | 60000 | Idle connection timeout in milliseconds |
 
-#### Direct pool usage
+#### Direct client usage
 
-You can also use the connection pool directly without the SDK:
+You can also use the HTTP client directly without the SDK:
 
 ```ruby
 require "aws_crt"
 
-pool = AwsCrt::Http::ConnectionPool.new("https://example.com")
-status, headers, body = pool.request("GET", "/path", [["Host", "example.com"]])
+client = AwsCrt::Http::Client.new(
+  max_connections: 25,
+  ssl_verify_peer: true
+)
+
+# Buffered response
+status, headers, body = client.request(
+  "https://example.com", "GET", "/path",
+  [["Host", "example.com"]]
+)
 
 # Streaming response
-pool.request("GET", "/large", [["Host", "example.com"]]) do |chunk|
+status, headers = client.request(
+  "https://example.com", "GET", "/large",
+  [["Host", "example.com"]]
+) do |chunk|
   # process each chunk as it arrives
 end
 ```
@@ -504,6 +524,166 @@ HTTP errors inherit from `AwsCrt::Http::Error`:
 - `TimeoutError` — connect or read timeout exceeded
 - `TlsError` — TLS handshake or certificate failures
 - `ProxyError` — proxy connection or authentication failures
+
+### SigV4 Signer
+
+The standalone SigV4 signer uses the CRT's `aws_sign_request_aws` to compute
+SigV4 signatures entirely in native code. The GVL is released during the
+async CRT signing callback, so other Ruby threads can run concurrently.
+
+The signer is configured once with a service name and signing options, then
+reused for multiple requests. Credentials and region are provided per-call
+to support credential rotation and multi-region use.
+
+```ruby
+require "aws_crt"
+
+signer = AwsCrt::Sigv4Signer.new(service: "sts")
+
+signed = signer.sign_request(
+  region: "us-east-1",
+  access_key_id: "AKIA...",
+  secret_access_key: "secret",
+  session_token: "token",       # optional
+  method: "POST",
+  uri: "/",
+  headers: [
+    ["host", "sts.amazonaws.com"],
+    ["content-type", "application/x-www-form-urlencoded"]
+  ],
+  body: "Action=GetCallerIdentity&Version=2011-06-15"
+)
+
+signed[:headers]  # => all headers including Authorization, X-Amz-Date, etc.
+signed[:method]   # => "POST" (unchanged)
+signed[:uri]      # => "/" (unchanged)
+```
+
+#### Configuration options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `service` | *(required)* | AWS service name (e.g. `"s3"`, `"sts"`, `"dynamodb"`) |
+| `apply_sha256_header` | true | Add the `x-amz-content-sha256` header |
+| `use_double_uri_encode` | true | Double-encode the URI path. Set to `false` for S3. |
+| `normalize_uri_path` | true | Normalize the URI path (remove `.` and `..`) |
+| `sign_body` | false | Compute SHA-256 of the body. When false, uses `UNSIGNED-PAYLOAD`. |
+
+#### S3-style signing
+
+S3 requires different signing options than most AWS services:
+
+```ruby
+signer = AwsCrt::Sigv4Signer.new(
+  service: "s3",
+  use_double_uri_encode: false,
+  normalize_uri_path: false
+)
+```
+
+#### Body signing
+
+For services that require body signing (e.g. DynamoDB):
+
+```ruby
+signer = AwsCrt::Sigv4Signer.new(service: "dynamodb", sign_body: true)
+```
+
+When `sign_body: true`, the CRT computes the SHA-256 hash of the request body
+and includes it in the `x-amz-content-sha256` header and the signature
+calculation.
+
+### Signed HTTP Client
+
+The signed HTTP client combines SigV4 signing and HTTP request sending into
+a single native call. This is a performance optimization for the common
+"sign and send" pattern — the CRT HTTP message is built once, signed
+in-place, and sent directly without converting back to Ruby types between
+the two operations.
+
+```ruby
+require "aws_crt"
+
+client = AwsCrt::SignedHttpClient.new(
+  service: "sts",
+  ssl_verify_peer: true,
+  max_connections: 25
+)
+client.freeze  # optional: makes it Ractor-shareable
+
+# Buffered response
+status, headers, body = client.request(
+  "https://sts.us-east-1.amazonaws.com",
+  "POST", "/",
+  [["host", "sts.us-east-1.amazonaws.com"],
+   ["content-type", "application/x-www-form-urlencoded"]],
+  "Action=GetCallerIdentity&Version=2011-06-15",
+  region: "us-east-1",
+  access_key_id: "AKIA...",
+  secret_access_key: "secret",
+  session_token: "token"  # optional
+)
+
+# Streaming response
+status, headers = client.request(
+  endpoint, "GET", "/large-object",
+  [["host", "s3.amazonaws.com"]],
+  nil,
+  region: "us-east-1",
+  access_key_id: creds.access_key_id,
+  secret_access_key: creds.secret_access_key,
+  session_token: creds.session_token
+) do |chunk|
+  io.write(chunk)
+end
+```
+
+#### Why use SignedHttpClient over separate Signer + Client?
+
+When using `Sigv4Signer` + `Http::Client` separately, a "sign and send"
+flow crosses the Ruby/Rust boundary twice:
+
+1. **Sign**: Ruby → Rust (build CRT message, sign, extract signed headers back to Ruby)
+2. **Send**: Ruby → Rust (rebuild CRT message from Ruby data, send, extract response)
+
+`SignedHttpClient` does it in one native call:
+
+1. **Sign + Send**: Ruby → Rust (build CRT message once, sign in-place, send directly)
+
+This eliminates one Ruby→Rust transition, one message rebuild, one set of
+type conversions, and one GVL release/acquire cycle.
+
+Use `SignedHttpClient` when you know you need to both sign and send. Use
+`Sigv4Signer` and `Http::Client` independently when you only need one or
+the other, or when you need to inspect/modify the signed headers before
+sending.
+
+#### Configuration options
+
+`SignedHttpClient` accepts all signing options from `Sigv4Signer` and all
+HTTP options from `Http::Client`:
+
+**Signing options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `service` | *(required)* | AWS service name |
+| `apply_sha256_header` | true | Add `x-amz-content-sha256` header |
+| `use_double_uri_encode` | true | Double-encode URI path |
+| `normalize_uri_path` | true | Normalize URI path |
+| `sign_body` | false | Compute SHA-256 of body |
+
+**HTTP client options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `max_connections` | 25 | Max concurrent connections per endpoint |
+| `max_connection_idle_ms` | 60000 | Idle connection timeout (ms) |
+| `connect_timeout_ms` | 60000 | Connection timeout (ms) |
+| `read_timeout_ms` | 0 | Read timeout (ms), 0 = no timeout |
+| `ssl_verify_peer` | true | Verify TLS certificates |
+| `ssl_ca_bundle` | nil | Path to custom CA bundle |
+| `proxy` | nil | Proxy config hash |
 
 ### S3 Client
 
@@ -706,6 +886,69 @@ The gem offers two ways to talk to S3:
 | Per-chunk retries | Yes | No (full-request retry only) |
 | File I/O | Direct CRT file I/O (bypasses Ruby) | Streams through Ruby |
 | Best for | Large object transfers (multi-MB+) | General AWS API calls, small S3 operations |
+
+### Ractor Support
+
+The HTTP client, signed HTTP client, and other key types are designed to be
+shared across Ruby 4 Ractors for true parallel execution. Freeze the object
+after construction to make it Ractor-shareable:
+
+```ruby
+# HTTP client — shared across Ractors
+client = AwsCrt::Http::Client.new(max_connections: 25)
+client.freeze
+
+# Signed HTTP client — shared across Ractors
+signed_client = AwsCrt::SignedHttpClient.new(service: "sts")
+signed_client.freeze
+
+# Verify shareability
+Ractor.shareable?(client)         # => true
+Ractor.shareable?(signed_client)  # => true
+
+# Use from multiple Ractors
+ractors = 4.times.map do |i|
+  Ractor.new(client, i) do |c, idx|
+    status, _, body = c.request(
+      "http://example.com", "GET", "/ractor-#{idx}",
+      [["Host", "example.com"]]
+    )
+    [idx, status]
+  end
+end
+results = ractors.map(&:take)
+```
+
+#### How it works
+
+Ractor safety is achieved through three mechanisms:
+
+1. **`frozen_shareable` flag** — The Rust `TypedData` implementation includes
+   the `RUBY_TYPED_FROZEN_SHAREABLE` flag, telling Ruby's Ractor system that
+   frozen instances can be shared.
+
+2. **Interior mutability with Mutex** — Mutable state (connection pool maps)
+   is protected by Rust's `Mutex`, invisible to Ruby's Ractor isolation checks.
+
+3. **No stored Ruby VALUEs** — Configuration is converted to Rust-native types
+   at construction time. The struct holds only Rust `String`, `HashMap`, and
+   CRT pointers — no Ruby object references that could violate Ractor isolation.
+
+The CRT event loop threads handle actual I/O independently of Ruby's Ractor
+model, so a single frozen client instance can efficiently serve requests from
+any number of Ractors running in parallel.
+
+### Choosing the right component
+
+| Use case | Component | Why |
+|----------|-----------|-----|
+| Replace Net::HTTP in the AWS SDK | `AwsCrt::Http::Plugin` | Drop-in, no code changes |
+| Standalone HTTP requests | `AwsCrt::Http::Client` | Direct control, connection pooling |
+| Sign requests without sending | `AwsCrt::Sigv4Signer` | Inspect/modify signed headers |
+| Sign and send in one shot | `AwsCrt::SignedHttpClient` | Best performance for sign+send |
+| High-throughput S3 transfers | `AwsCrt::S3::Client` | Parallel multipart, per-chunk retries |
+| Hardware-accelerated checksums | `AwsCrt::Checksums` | CRC32, CRC32C, CRC64-NVME |
+| Fast CBOR serialization | `AwsCrt::Cbor` | Drop-in for `Aws::Cbor` |
 
 ## License
 
