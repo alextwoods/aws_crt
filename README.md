@@ -17,374 +17,37 @@ The native extension is written in Rust (using [magnus](https://github.com/matsa
 and [rb_sys](https://github.com/oxidize-rb/rb-sys)) and calls directly into
 the CRT C libraries via FFI — no data copying, no Ruby FFI gem overhead.
 
-## Architecture
+## Requirements
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Ruby caller                                            │
-│  AwsCrt::Checksums.crc32(data)                          │
-│  AwsCrt::Cbor.encode(data)                              │
-│  Aws::S3::Client.new  (with CRT HTTP handler)           │
-│  AwsCrt::S3::Client.new  (standalone CRT S3 client)     │
-│  AwsCrt::Sigv4Signer.new  (standalone SigV4 signer)     │
-│  AwsCrt::SignedHttpClient.new  (sign + send in one call) │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────┐
-│  Ruby integration layer                                  │
-│  lib/aws_crt/http/handler.rb     Seahorse :send handler  │
-│  lib/aws_crt/http/plugin.rb      SDK plugin + config     │
-│  lib/aws_crt/http/patcher.rb     auto-patch on require   │
-│  lib/aws_crt/sigv4_signer.rb    SigV4 signer wrapper     │
-│  lib/aws_crt/signed_http_client.rb  combined sign+send   │
-│  lib/aws_crt/s3/client.rb        S3 client wrapper       │
-│  lib/aws_crt/s3/response.rb      S3 response object      │
-│  lib/aws_crt/s3/errors.rb        S3 error hierarchy      │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────┐
-│  Rust extension  (magnus / rb_sys)                       │
-│  src/lib.rs               entry point + checksum FFI     │
-│  src/cbor.rs              CBOR encode/decode             │
-│  src/http.rs              request/response execution     │
-│  src/http_client.rs       Ruby-facing HTTP client class  │
-│  src/connection_manager.rs  CRT connection pool wrapper  │
-│  src/sigv4_signer.rs      SigV4 signing (standalone)     │
-│  src/signed_http_client.rs  combined sign + send         │
-│  src/s3_client.rs         CRT S3 client wrapper          │
-│  src/s3_request.rs        S3 meta-request execution      │
-│  src/s3_ruby.rs           Ruby-facing S3 class           │
-│  src/credentials.rs       CRT credentials bridge         │
-│  src/signing.rs           CRT signing config (S3)        │
-│  src/runtime.rs           shared CRT resources (once)    │
-│  src/tls.rs               TLS context management         │
-│  src/proxy.rs             proxy configuration            │
-│  src/error.rs             CRT → Ruby error translation   │
-└──────────────────────────┬──────────────────────────────┘
-                           │  extern "C" / calls
-┌──────────────────────────▼──────────────────────────────┐
-│  CRT C static libraries                                  │
-│  aws-c-s3            S3 meta-requests + parallel I/O     │
-│  aws-c-auth          credentials + SigV4 signing         │
-│  aws-c-sdkutils      SDK utility functions               │
-│  aws-c-http          HTTP/1.1 protocol + conn manager    │
-│  aws-c-compression   HTTP content encoding               │
-│  aws-c-io            event loops, TLS, sockets, DNS      │
-│  aws-c-cal           crypto abstraction layer             │
-│  aws-checksums       hardware-accelerated CRC             │
-│  aws-c-common        allocators, byte buffers, logging    │
-│  s2n-tls             TLS provider (Linux only)            │
-└─────────────────────────────────────────────────────────┘
-```
-
-## CRT Libraries
-
-The CRT libraries are included as git submodules under `crt/`. The full
-dependency graph for HTTP and S3 support is:
-
-```
-crt/
-├── CMakeLists.txt          # Top-level cmake that builds all libraries
-├── aws-c-common/           # Core CRT utilities (allocators, byte buffers, logging)
-├── aws-checksums/          # Hardware-accelerated CRC implementations
-├── aws-c-cal/              # Crypto abstraction layer
-├── aws-c-io/               # Event loops, sockets, TLS, DNS resolver
-├── aws-c-compression/      # HTTP content encoding (huffman, etc.)
-├── aws-c-http/             # HTTP/1.1 protocol and connection manager
-├── aws-c-sdkutils/         # SDK utility functions
-├── aws-c-auth/             # Credentials and SigV4 signing
-├── aws-c-s3/               # S3 meta-requests, parallel I/O, request splitting
-└── s2n-tls/                # TLS provider (Linux only; macOS uses Security.framework)
-```
-
-The build order follows the CRT dependency graph:
-
-```
-aws-c-common
-├── aws-checksums
-├── aws-c-cal
-│   └── aws-c-io  (+ s2n-tls on Linux)
-│       ├── aws-c-compression
-│       └── aws-c-http
-├── aws-c-sdkutils
-├── aws-c-auth  (depends on aws-c-sdkutils, aws-c-cal, aws-c-http)
-└── aws-c-s3    (depends on aws-c-auth, aws-checksums)
-```
-
-### How they're built
-
-The build is driven by cmake and orchestrated through Rake:
-
-1. `rake crt:compile` runs cmake to configure and build all CRT C libraries as
-   static archives (`.a` files) into `crt/install/`. The cmake project
-   (`crt/CMakeLists.txt`) adds libraries in dependency order: `aws-c-common`
-   first, then `aws-checksums`, `aws-c-cal`, `s2n-tls` (Linux only),
-   `aws-c-io`, `aws-c-compression`, `aws-c-http`, `aws-c-sdkutils`,
-   `aws-c-auth`, and `aws-c-s3`. Shared libraries and tests are disabled —
-   only the static libraries and headers are installed.
-
-2. `rake compile` depends on `crt:compile`, so the CRT libraries are always
-   built before the Rust extension. The Rust `build.rs` script locates the
-   pre-built static libraries under `crt/install/lib/` and tells Cargo to
-   link them into the final `.bundle`/`.so` in the correct dependency order
-   (dependents first: `aws-c-s3` → `aws-c-auth` → `aws-c-sdkutils` →
-   `aws-c-http` → `aws-c-compression` → `aws-c-io` → `aws-c-cal` →
-   `aws-checksums` → `aws-c-common`). On Linux, `s2n-tls` and `libcrypto`
-   are also linked. On macOS, Security.framework and CoreFoundation.framework
-   are linked for TLS and platform services.
-
-3. The Rust extension (`ext/aws_crt/`) uses `rb_sys` and `magnus` to bridge
-   between Ruby and Rust. The Rust code declares `extern "C"` bindings to
-   CRT checksum functions (in `src/lib.rs`), CRT HTTP APIs (in `src/http.rs`,
-   `src/connection_manager.rs`, `src/runtime.rs`, `src/tls.rs`, `src/proxy.rs`),
-   CRT signing APIs (in `src/sigv4_signer.rs`, `src/signed_http_client.rs`,
-   `src/credentials.rs`), and CRT S3 APIs (in `src/s3_client.rs`,
-   `src/s3_request.rs`, `src/signing.rs`). The HTTP, signing, and S3 paths
-   all release the GVL during blocking I/O so other Ruby threads can run
-   concurrently.
-
-### How they're included in the gem
-
-When building the gem for distribution (`rake build`), the gemspec
-automatically includes the pre-built CRT static libraries and headers from
-`crt/install/` if they exist. This means end users installing a pre-built
-platform gem don't need cmake installed — only Rust (for the native extension
-compilation via `rb_sys`).
-
-For source gem installs, the full build chain runs: cmake builds the CRT
-libraries, then Cargo compiles the Rust extension and statically links them.
-
-## CBOR Performance
-
-The CBOR encoder and decoder are optimized for minimal overhead on the
-Ruby-to-Rust boundary. Several techniques are borrowed from Ruby's own
-[JSON native extension](https://github.com/ruby/json) (the `rvalue_cache`,
-`rb_hash_bulk_insert`, and `rb_enc_interned_str` patterns) and adapted for
-the CBOR format.
-
-### Encoding
-
-- **Raw `rb_sys` API** — Bypasses magnus wrapper overhead for type checking
-  and value extraction. Uses `FIXNUM_P`/`FIX2LONG` for integers,
-  `RSTRING_PTR`/`RSTRING_LEN` for strings, `RARRAY_CONST_PTR` for arrays,
-  and `rb_hash_foreach` for hash iteration — all avoiding Ruby method calls
-  and intermediate allocations.
-- **Cached class references** — `Time`, `BigDecimal`, and `Tagged` class
-  VALUEs are resolved once at init and stored in statics, avoiding repeated
-  constant lookups during encoding.
-- **Module-level `encode`/`decode` functions** — `AwsCrt::Cbor.encode(data)`
-  and `AwsCrt::Cbor.decode(bytes)` skip Ruby object allocation entirely,
-  operating on a stack-allocated `Vec<u8>` buffer.
-- **Auto float precision** — Floats that can be represented exactly as
-  single-precision are encoded as 4 bytes instead of 8, matching the CBOR
-  gem's behavior and reducing output size.
-- **Combined head+body writes** — For short strings (≤23 bytes), the CBOR
-  header byte and string body are written with a single reserve+extend,
-  reducing per-string overhead.
-
-### Decoding
-
-- **String interning cache for map keys** — Inspired by the JSON parser's
-  `rvalue_cache`, a sorted-array cache with binary search (capacity 63,
-  max key length 55 bytes) deduplicates repeated map keys using
-  `rb_enc_interned_str`. In real-world payloads where the same keys
-  ("id", "name", "tags", …) appear across hundreds of array items, each
-  unique key is allocated once and reused — dramatically reducing GC
-  pressure. The cache is shared across the entire decode tree so nested
-  maps and arrays all benefit.
-- **Bulk hash insertion** — For maps with ≤32 entries, key-value pairs are
-  collected into a stack-allocated array and inserted via
-  `rb_hash_bulk_insert`, avoiding per-pair `rb_hash_aset` overhead.
-- **Inlined fast paths** — Small integers (0–23, -1–-24) and short text
-  strings (length < 24) are decoded inline in the main dispatch loop,
-  avoiding function call overhead for the most common CBOR types.
-- **Inlined float decode** — Single and double precision floats are decoded
-  directly in the `decode_value` match arm rather than through helper
-  functions.
-- **Direct Ruby object creation** — Uses `rb_float_new`, `LONG2FIX`,
-  `rb_enc_str_new`, `rb_ary_new_capa`, `rb_hash_new_capa`, and
-  `rb_hash_aset` directly, bypassing magnus value conversion.
-
-### Benchmark results
-
-Measured on Apple M3 Pro, Ruby 4.0.0, comparing against the
-[cbor](https://rubygems.org/gems/cbor) C extension gem and Ruby's built-in
-JSON:
-
-**Encode** (iterations/second, higher is better):
-
-| Payload | AwsCrt::Cbor.encode | CBOR gem (C) | JSON.dump | Aws::Cbor (pure Ruby) |
-|---------|--------------------:|-------------:|----------:|----------------------:|
-| Small (3-key int map) | 6.95M | 4.76M | 4.33M | 376k |
-| Medium (50-key string map) | 663k | 659k | 573k | 21k |
-| Large (nested mixed) | 46.9k | 47.2k | 41.5k | 1.3k |
-
-**Decode** (iterations/second, higher is better):
-
-| Payload | AwsCrt::Cbor.decode | CBOR gem (C) | JSON.parse | Aws::Cbor (pure Ruby) |
-|---------|--------------------:|-------------:|-----------:|----------------------:|
-| Small (3-key int map) | 5.40M | 2.54M | 4.12M | 249k |
-| Medium (50-key string map) | 174k | 172k | 212k | 16k |
-| Large (nested mixed) | 25.0k | 12.5k | 23.8k | 796 |
-
-Encoding is 1.5x faster than the CBOR C gem on small payloads and
-competitive on larger ones. Decoding beats the CBOR C gem by 2x on both
-small and large payloads, and matches or exceeds JSON on small and large
-payloads. The string interning cache is the key differentiator on large
-payloads — where repeated map keys across 100+ array items are interned
-once instead of allocated per-item, cutting GC overhead significantly.
-
-**Wire size** — CBOR also produces smaller payloads than JSON (no key
-quoting, no delimiters, binary integer/float encoding):
-
-| Payload | CBOR bytes | JSON bytes | Savings |
-|---------|----------:|----------:|---------:|
-| Medium (50-key string map) | 2,392 | 2,541 | 6% |
-| Large (nested mixed) | 10,937 | 14,563 | 25% |
-
-## Prerequisites
-
-- Ruby >= 3.0
+- Ruby >= 4.0.0
 - Rust (stable) — install via [rustup](https://rustup.rs/)
 - CMake >= 3.9
 - A C compiler (clang or gcc)
-- Bundler
 
-## Setup
+On macOS, Xcode Command Line Tools provides both the C compiler and CMake.
+On Linux, install `cmake`, `build-essential` (Debian/Ubuntu) or the
+equivalent for your distribution.
 
-Clone the repo with submodules:
+## Installation
 
-```sh
-git clone --recurse-submodules https://github.com/awslabs/aws_crt.git
-cd aws_crt
-bundle install
-```
-(Note, if you get errors you may need to do `
-`)
+The gem is not yet published as a pre-built platform gem on RubyGems. Install
+it from the git source by adding the following to your Gemfile:
 
-If you already cloned without `--recurse-submodules`:
-
-```sh
-git submodule update --init --recursive
+```ruby
+gem "aws_crt", git: "https://github.com/alextwoods/aws_crt", submodules: true
 ```
 
-## Common Commands
+The `submodules: true` option is required — the CRT C libraries are included
+as git submodules and must be fetched for the build to succeed.
 
-### Build everything (CRT libs + Rust extension)
+When you run `bundle install`, the build process will:
 
-```sh
-bundle exec rake compile
-```
+1. Clone the repository and initialize all git submodules.
+2. Compile the CRT C libraries from source using CMake (into `crt/install/`).
+3. Compile the Rust native extension and statically link the CRT libraries.
 
-This runs `crt:compile` first (cmake builds the static CRT libraries into
-`crt/install/`), then compiles the Rust extension and places the resulting
-`.bundle`/`.so` in `lib/aws_crt/`.
-
-### Run tests
-
-```sh
-bundle exec rake spec
-```
-
-### Run the linter
-
-```sh
-bundle exec rake rubocop
-```
-
-### Run the full default task (compile + spec + rubocop)
-
-```sh
-bundle exec rake
-```
-
-### Run benchmarks
-
-```sh
-bundle exec rake benchmark              # checksums + CBOR + HTTP (local)
-bundle exec rake benchmark:cbor         # CBOR encode/decode
-bundle exec rake benchmark:http         # HTTP (local test server)
-bundle exec rake benchmark:http:s3      # S3 get/put (benchmark-ips)
-bundle exec rake benchmark:http:dynamodb            # DynamoDB get/put (benchmark-ips)
-bundle exec rake benchmark:http:s3_concurrent       # S3 concurrent I/O
-bundle exec rake benchmark:http:dynamodb_concurrent # DynamoDB concurrent I/O
-bundle exec ruby benchmarks/s3.rb       # CRT S3 client vs SDK (benchmark-ips)
-```
-
-#### Service benchmarks (S3 & DynamoDB)
-
-The `benchmark:http:s3` and `benchmark:http:dynamodb` tasks use `benchmark-ips`
-to compare single-threaded request throughput between the default `Net::HTTP`
-handler and the CRT HTTP plugin. All operations run in a single `Benchmark.ips`
-block so that `compare!` produces a meaningful cross-comparison.
-
-| ENV var | Default | Description |
-|---------|---------|-------------|
-| `BENCH_S3_BUCKET` | `test-bucket-alexwoo-2` | S3 bucket for test objects |
-| `BENCH_DYNAMODB_TABLE` | *(see source)* | DynamoDB table (partition key `id`, String) |
-
-#### Concurrent I/O benchmarks
-
-The `_concurrent` variants use `concurrent-ruby` with a fixed thread pool to
-measure throughput under parallel load — closer to real-world SDK usage than
-single-threaded `benchmark-ips`.
-
-| ENV var | Default | Description |
-|---------|---------|-------------|
-| `BENCH_TOTAL_CALLS` | `1000` | Total number of API calls to make |
-| `BENCH_THREADS` | `8` | Thread pool size |
-| `BENCH_S3_BUCKET` | `test-bucket-alexwoo-2` | S3 bucket for test objects |
-| `BENCH_DYNAMODB_TABLE` | *(see source)* | DynamoDB table (partition key `id`, String) |
-
-Example with custom concurrency settings:
-
-```sh
-BENCH_THREADS=16 BENCH_TOTAL_CALLS=5000 bundle exec rake benchmark:http:s3_concurrent
-```
-
-#### CRT S3 client benchmarks
-
-The `benchmarks/s3.rb` script compares the standalone CRT S3 client
-(`AwsCrt::S3::Client`) against the standard `Aws::S3::Client` for upload and
-download throughput. It tests both in-memory and file I/O paths at 1MB and
-100MB object sizes.
-
-| ENV var | Default | Description |
-|---------|---------|-------------|
-| `BENCH_S3_BUCKET` | `crt-s3-benchmark` | S3 bucket for test objects |
-| `BENCH_S3_REGION` | `us-east-1` | AWS region |
-
-```sh
-BENCH_S3_BUCKET=my-bucket BENCH_S3_REGION=us-west-2 bundle exec ruby benchmarks/s3.rb
-```
-
-### Build the CRT libraries only
-
-```sh
-bundle exec rake crt:compile
-```
-
-### Clean CRT build artifacts
-
-```sh
-bundle exec rake crt:clean
-```
-
-### Build the gem for distribution
-
-```sh
-bundle exec rake build
-```
-
-This produces a `.gem` file in `pkg/`. For platform gems with pre-built
-binaries, the CRT static libraries and compiled Rust extension are included
-so that end users don't need cmake or Rust installed.
-
-### Install locally
-
-```sh
-bundle exec rake install
-```
+This takes a few minutes on the first install. Subsequent installs reuse
+cached build artifacts.
 
 ## Usage
 
@@ -783,8 +446,6 @@ File.open("/tmp/large-file.bin", "wb") do |f|
   resp = client.get_object(bucket: "my-bucket", key: "large-file.bin",
                            response_target: f)
 end
-# File objects are automatically converted to their path, so this is
-# just as fast as passing the path string directly.
 
 # Stream to an IO object
 io = StringIO.new
@@ -943,25 +604,6 @@ end
 results = ractors.map(&:take)
 ```
 
-#### How it works
-
-Ractor safety is achieved through three mechanisms:
-
-1. **`frozen_shareable` flag** — The Rust `TypedData` implementation includes
-   the `RUBY_TYPED_FROZEN_SHAREABLE` flag, telling Ruby's Ractor system that
-   frozen instances can be shared.
-
-2. **Interior mutability with Mutex** — Mutable state (connection pool maps)
-   is protected by Rust's `Mutex`, invisible to Ruby's Ractor isolation checks.
-
-3. **No stored Ruby VALUEs** — Configuration is converted to Rust-native types
-   at construction time. The struct holds only Rust `String`, `HashMap`, and
-   CRT pointers — no Ruby object references that could violate Ractor isolation.
-
-The CRT event loop threads handle actual I/O independently of Ruby's Ractor
-model, so a single frozen client instance can efficiently serve requests from
-any number of Ractors running in parallel.
-
 ### Choosing the right component
 
 | Use case | Component | Why |
@@ -986,3 +628,390 @@ The AWS CRT libraries are licensed under [Apache-2.0](https://www.apache.org/lic
 Everyone interacting in this project's codebases, issue trackers, chat rooms,
 and mailing lists is expected to follow the
 [code of conduct](CODE_OF_CONDUCT.md).
+
+
+---
+
+## Development
+
+### Setup
+
+Clone the repo with submodules:
+
+```sh
+git clone --recurse-submodules https://github.com/awslabs/aws_crt.git
+cd aws_crt
+bundle install
+```
+
+If you already cloned without `--recurse-submodules`:
+
+```sh
+git submodule update --init --recursive
+```
+
+### Common Commands
+
+#### Build everything (CRT libs + Rust extension)
+
+```sh
+bundle exec rake compile
+```
+
+This runs `crt:compile` first (cmake builds the static CRT libraries into
+`crt/install/`), then compiles the Rust extension and places the resulting
+`.bundle`/`.so` in `lib/aws_crt/`.
+
+#### Run tests
+
+```sh
+bundle exec rake spec
+```
+
+#### Run the linter
+
+```sh
+bundle exec rake rubocop
+```
+
+#### Run the full default task (compile + spec + rubocop)
+
+```sh
+bundle exec rake
+```
+
+#### Run benchmarks
+
+```sh
+bundle exec rake benchmark              # checksums + CBOR + HTTP (local)
+bundle exec rake benchmark:cbor         # CBOR encode/decode
+bundle exec rake benchmark:http         # HTTP (local test server)
+bundle exec rake benchmark:http:s3      # S3 get/put (benchmark-ips)
+bundle exec rake benchmark:http:dynamodb            # DynamoDB get/put (benchmark-ips)
+bundle exec rake benchmark:http:s3_concurrent       # S3 concurrent I/O
+bundle exec rake benchmark:http:dynamodb_concurrent # DynamoDB concurrent I/O
+bundle exec ruby benchmarks/s3.rb       # CRT S3 client vs SDK (benchmark-ips)
+```
+
+##### Service benchmarks (S3 & DynamoDB)
+
+The `benchmark:http:s3` and `benchmark:http:dynamodb` tasks use `benchmark-ips`
+to compare single-threaded request throughput between the default `Net::HTTP`
+handler and the CRT HTTP plugin. All operations run in a single `Benchmark.ips`
+block so that `compare!` produces a meaningful cross-comparison.
+
+| ENV var | Default | Description |
+|---------|---------|-------------|
+| `BENCH_S3_BUCKET` | `test-bucket-alexwoo-2` | S3 bucket for test objects |
+| `BENCH_DYNAMODB_TABLE` | *(see source)* | DynamoDB table (partition key `id`, String) |
+
+##### Concurrent I/O benchmarks
+
+The `_concurrent` variants use `concurrent-ruby` with a fixed thread pool to
+measure throughput under parallel load — closer to real-world SDK usage than
+single-threaded `benchmark-ips`.
+
+| ENV var | Default | Description |
+|---------|---------|-------------|
+| `BENCH_TOTAL_CALLS` | `1000` | Total number of API calls to make |
+| `BENCH_THREADS` | `8` | Thread pool size |
+| `BENCH_S3_BUCKET` | `test-bucket-alexwoo-2` | S3 bucket for test objects |
+| `BENCH_DYNAMODB_TABLE` | *(see source)* | DynamoDB table (partition key `id`, String) |
+
+Example with custom concurrency settings:
+
+```sh
+BENCH_THREADS=16 BENCH_TOTAL_CALLS=5000 bundle exec rake benchmark:http:s3_concurrent
+```
+
+##### CRT S3 client benchmarks
+
+The `benchmarks/s3.rb` script compares the standalone CRT S3 client
+(`AwsCrt::S3::Client`) against the standard `Aws::S3::Client` for upload and
+download throughput. It tests both in-memory and file I/O paths at 1MB and
+100MB object sizes.
+
+| ENV var | Default | Description |
+|---------|---------|-------------|
+| `BENCH_S3_BUCKET` | `crt-s3-benchmark` | S3 bucket for test objects |
+| `BENCH_S3_REGION` | `us-east-1` | AWS region |
+
+```sh
+BENCH_S3_BUCKET=my-bucket BENCH_S3_REGION=us-west-2 bundle exec ruby benchmarks/s3.rb
+```
+
+#### Build the CRT libraries only
+
+```sh
+bundle exec rake crt:compile
+```
+
+#### Clean CRT build artifacts
+
+```sh
+bundle exec rake crt:clean
+```
+
+#### Build the gem for distribution
+
+```sh
+bundle exec rake build
+```
+
+This produces a `.gem` file in `pkg/`. For platform gems with pre-built
+binaries, the CRT static libraries and compiled Rust extension are included
+so that end users don't need cmake or Rust installed.
+
+#### Install locally
+
+```sh
+bundle exec rake install
+```
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Ruby caller                                            │
+│  AwsCrt::Checksums.crc32(data)                          │
+│  AwsCrt::Cbor.encode(data)                              │
+│  Aws::S3::Client.new  (with CRT HTTP handler)           │
+│  AwsCrt::S3::Client.new  (standalone CRT S3 client)     │
+│  AwsCrt::Sigv4Signer.new  (standalone SigV4 signer)     │
+│  AwsCrt::SignedHttpClient.new  (sign + send in one call) │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────┐
+│  Ruby integration layer                                  │
+│  lib/aws_crt/http/handler.rb     Seahorse :send handler  │
+│  lib/aws_crt/http/plugin.rb      SDK plugin + config     │
+│  lib/aws_crt/http/patcher.rb     auto-patch on require   │
+│  lib/aws_crt/sigv4_signer.rb    SigV4 signer wrapper     │
+│  lib/aws_crt/signed_http_client.rb  combined sign+send   │
+│  lib/aws_crt/s3/client.rb        S3 client wrapper       │
+│  lib/aws_crt/s3/response.rb      S3 response object      │
+│  lib/aws_crt/s3/errors.rb        S3 error hierarchy      │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────┐
+│  Rust extension  (magnus / rb_sys)                       │
+│  src/lib.rs               entry point + checksum FFI     │
+│  src/cbor.rs              CBOR encode/decode             │
+│  src/http.rs              request/response execution     │
+│  src/http_client.rs       Ruby-facing HTTP client class  │
+│  src/connection_manager.rs  CRT connection pool wrapper  │
+│  src/sigv4_signer.rs      SigV4 signing (standalone)     │
+│  src/signed_http_client.rs  combined sign + send         │
+│  src/s3_client.rs         CRT S3 client wrapper          │
+│  src/s3_request.rs        S3 meta-request execution      │
+│  src/s3_ruby.rs           Ruby-facing S3 class           │
+│  src/credentials.rs       CRT credentials bridge         │
+│  src/signing.rs           CRT signing config (S3)        │
+│  src/runtime.rs           shared CRT resources (once)    │
+│  src/tls.rs               TLS context management         │
+│  src/proxy.rs             proxy configuration            │
+│  src/error.rs             CRT → Ruby error translation   │
+└──────────────────────────┬──────────────────────────────┘
+                           │  extern "C" / calls
+┌──────────────────────────▼──────────────────────────────┐
+│  CRT C static libraries                                  │
+│  aws-c-s3            S3 meta-requests + parallel I/O     │
+│  aws-c-auth          credentials + SigV4 signing         │
+│  aws-c-sdkutils      SDK utility functions               │
+│  aws-c-http          HTTP/1.1 protocol + conn manager    │
+│  aws-c-compression   HTTP content encoding               │
+│  aws-c-io            event loops, TLS, sockets, DNS      │
+│  aws-c-cal           crypto abstraction layer             │
+│  aws-checksums       hardware-accelerated CRC             │
+│  aws-c-common        allocators, byte buffers, logging    │
+│  s2n-tls             TLS provider (Linux only)            │
+└─────────────────────────────────────────────────────────┘
+```
+
+### CRT Libraries
+
+The CRT libraries are included as git submodules under `crt/`. The full
+dependency graph for HTTP and S3 support is:
+
+```
+crt/
+├── CMakeLists.txt          # Top-level cmake that builds all libraries
+├── aws-c-common/           # Core CRT utilities (allocators, byte buffers, logging)
+├── aws-checksums/          # Hardware-accelerated CRC implementations
+├── aws-c-cal/              # Crypto abstraction layer
+├── aws-c-io/               # Event loops, sockets, TLS, DNS resolver
+├── aws-c-compression/      # HTTP content encoding (huffman, etc.)
+├── aws-c-http/             # HTTP/1.1 protocol and connection manager
+├── aws-c-sdkutils/         # SDK utility functions
+├── aws-c-auth/             # Credentials and SigV4 signing
+├── aws-c-s3/               # S3 meta-requests, parallel I/O, request splitting
+└── s2n-tls/                # TLS provider (Linux only; macOS uses Security.framework)
+```
+
+The build order follows the CRT dependency graph:
+
+```
+aws-c-common
+├── aws-checksums
+├── aws-c-cal
+│   └── aws-c-io  (+ s2n-tls on Linux)
+│       ├── aws-c-compression
+│       └── aws-c-http
+├── aws-c-sdkutils
+├── aws-c-auth  (depends on aws-c-sdkutils, aws-c-cal, aws-c-http)
+└── aws-c-s3    (depends on aws-c-auth, aws-checksums)
+```
+
+#### How they're built
+
+The build is driven by cmake and orchestrated through Rake:
+
+1. `rake crt:compile` runs cmake to configure and build all CRT C libraries as
+   static archives (`.a` files) into `crt/install/`. The cmake project
+   (`crt/CMakeLists.txt`) adds libraries in dependency order: `aws-c-common`
+   first, then `aws-checksums`, `aws-c-cal`, `s2n-tls` (Linux only),
+   `aws-c-io`, `aws-c-compression`, `aws-c-http`, `aws-c-sdkutils`,
+   `aws-c-auth`, and `aws-c-s3`. Shared libraries and tests are disabled —
+   only the static libraries and headers are installed.
+
+2. `rake compile` depends on `crt:compile`, so the CRT libraries are always
+   built before the Rust extension. The Rust `build.rs` script locates the
+   pre-built static libraries under `crt/install/lib/` and tells Cargo to
+   link them into the final `.bundle`/`.so` in the correct dependency order
+   (dependents first: `aws-c-s3` → `aws-c-auth` → `aws-c-sdkutils` →
+   `aws-c-http` → `aws-c-compression` → `aws-c-io` → `aws-c-cal` →
+   `aws-checksums` → `aws-c-common`). On Linux, `s2n-tls` and `libcrypto`
+   are also linked. On macOS, Security.framework and CoreFoundation.framework
+   are linked for TLS and platform services. If the pre-built libraries are
+   not found and the CRT source tree is available, `build.rs` will
+   automatically invoke cmake to compile them — this is what makes
+   `bundle install` from a git source work without a separate
+   `rake crt:compile` step.
+
+3. The Rust extension (`ext/aws_crt/`) uses `rb_sys` and `magnus` to bridge
+   between Ruby and Rust. The Rust code declares `extern "C"` bindings to
+   CRT checksum functions (in `src/lib.rs`), CRT HTTP APIs (in `src/http.rs`,
+   `src/connection_manager.rs`, `src/runtime.rs`, `src/tls.rs`, `src/proxy.rs`),
+   CRT signing APIs (in `src/sigv4_signer.rs`, `src/signed_http_client.rs`,
+   `src/credentials.rs`), and CRT S3 APIs (in `src/s3_client.rs`,
+   `src/s3_request.rs`, `src/signing.rs`). The HTTP, signing, and S3 paths
+   all release the GVL during blocking I/O so other Ruby threads can run
+   concurrently.
+
+#### How they're included in the gem
+
+When building the gem for distribution (`rake build`), the gemspec
+automatically includes the pre-built CRT static libraries and headers from
+`crt/install/` if they exist. This means end users installing a pre-built
+platform gem don't need cmake installed — only Rust (for the native extension
+compilation via `rb_sys`).
+
+For source gem installs, the full build chain runs: cmake builds the CRT
+libraries, then Cargo compiles the Rust extension and statically links them.
+
+#### Ractor safety internals
+
+Ractor safety is achieved through three mechanisms:
+
+1. **`frozen_shareable` flag** — The Rust `TypedData` implementation includes
+   the `RUBY_TYPED_FROZEN_SHAREABLE` flag, telling Ruby's Ractor system that
+   frozen instances can be shared.
+
+2. **Interior mutability with Mutex** — Mutable state (connection pool maps)
+   is protected by Rust's `Mutex`, invisible to Ruby's Ractor isolation checks.
+
+3. **No stored Ruby VALUEs** — Configuration is converted to Rust-native types
+   at construction time. The struct holds only Rust `String`, `HashMap`, and
+   CRT pointers — no Ruby object references that could violate Ractor isolation.
+
+The CRT event loop threads handle actual I/O independently of Ruby's Ractor
+model, so a single frozen client instance can efficiently serve requests from
+any number of Ractors running in parallel.
+
+### CBOR Performance
+
+The CBOR encoder and decoder are optimized for minimal overhead on the
+Ruby-to-Rust boundary. Several techniques are borrowed from Ruby's own
+[JSON native extension](https://github.com/ruby/json) (the `rvalue_cache`,
+`rb_hash_bulk_insert`, and `rb_enc_interned_str` patterns) and adapted for
+the CBOR format.
+
+#### Encoding
+
+- **Raw `rb_sys` API** — Bypasses magnus wrapper overhead for type checking
+  and value extraction. Uses `FIXNUM_P`/`FIX2LONG` for integers,
+  `RSTRING_PTR`/`RSTRING_LEN` for strings, `RARRAY_CONST_PTR` for arrays,
+  and `rb_hash_foreach` for hash iteration — all avoiding Ruby method calls
+  and intermediate allocations.
+- **Cached class references** — `Time`, `BigDecimal`, and `Tagged` class
+  VALUEs are resolved once at init and stored in statics, avoiding repeated
+  constant lookups during encoding.
+- **Module-level `encode`/`decode` functions** — `AwsCrt::Cbor.encode(data)`
+  and `AwsCrt::Cbor.decode(bytes)` skip Ruby object allocation entirely,
+  operating on a stack-allocated `Vec<u8>` buffer.
+- **Auto float precision** — Floats that can be represented exactly as
+  single-precision are encoded as 4 bytes instead of 8, matching the CBOR
+  gem's behavior and reducing output size.
+- **Combined head+body writes** — For short strings (≤23 bytes), the CBOR
+  header byte and string body are written with a single reserve+extend,
+  reducing per-string overhead.
+
+#### Decoding
+
+- **String interning cache for map keys** — Inspired by the JSON parser's
+  `rvalue_cache`, a sorted-array cache with binary search (capacity 63,
+  max key length 55 bytes) deduplicates repeated map keys using
+  `rb_enc_interned_str`. In real-world payloads where the same keys
+  ("id", "name", "tags", …) appear across hundreds of array items, each
+  unique key is allocated once and reused — dramatically reducing GC
+  pressure. The cache is shared across the entire decode tree so nested
+  maps and arrays all benefit.
+- **Bulk hash insertion** — For maps with ≤32 entries, key-value pairs are
+  collected into a stack-allocated array and inserted via
+  `rb_hash_bulk_insert`, avoiding per-pair `rb_hash_aset` overhead.
+- **Inlined fast paths** — Small integers (0–23, -1–-24) and short text
+  strings (length < 24) are decoded inline in the main dispatch loop,
+  avoiding function call overhead for the most common CBOR types.
+- **Inlined float decode** — Single and double precision floats are decoded
+  directly in the `decode_value` match arm rather than through helper
+  functions.
+- **Direct Ruby object creation** — Uses `rb_float_new`, `LONG2FIX`,
+  `rb_enc_str_new`, `rb_ary_new_capa`, `rb_hash_new_capa`, and
+  `rb_hash_aset` directly, bypassing magnus value conversion.
+
+#### Benchmark results
+
+Measured on Apple M3 Pro, Ruby 4.0.0, comparing against the
+[cbor](https://rubygems.org/gems/cbor) C extension gem and Ruby's built-in
+JSON:
+
+**Encode** (iterations/second, higher is better):
+
+| Payload | AwsCrt::Cbor.encode | CBOR gem (C) | JSON.dump | Aws::Cbor (pure Ruby) |
+|---------|--------------------:|-------------:|----------:|----------------------:|
+| Small (3-key int map) | 6.95M | 4.76M | 4.33M | 376k |
+| Medium (50-key string map) | 663k | 659k | 573k | 21k |
+| Large (nested mixed) | 46.9k | 47.2k | 41.5k | 1.3k |
+
+**Decode** (iterations/second, higher is better):
+
+| Payload | AwsCrt::Cbor.decode | CBOR gem (C) | JSON.parse | Aws::Cbor (pure Ruby) |
+|---------|--------------------:|-------------:|-----------:|----------------------:|
+| Small (3-key int map) | 5.40M | 2.54M | 4.12M | 249k |
+| Medium (50-key string map) | 174k | 172k | 212k | 16k |
+| Large (nested mixed) | 25.0k | 12.5k | 23.8k | 796 |
+
+Encoding is 1.5x faster than the CBOR C gem on small payloads and
+competitive on larger ones. Decoding beats the CBOR C gem by 2x on both
+small and large payloads, and matches or exceeds JSON on small and large
+payloads. The string interning cache is the key differentiator on large
+payloads — where repeated map keys across 100+ array items are interned
+once instead of allocated per-item, cutting GC overhead significantly.
+
+**Wire size** — CBOR also produces smaller payloads than JSON (no key
+quoting, no delimiters, binary integer/float encoding):
+
+| Payload | CBOR bytes | JSON bytes | Savings |
+|---------|----------:|----------:|---------:|
+| Medium (50-key string map) | 2,392 | 2,541 | 6% |
+| Large (nested mixed) | 10,937 | 14,563 | 25% |
