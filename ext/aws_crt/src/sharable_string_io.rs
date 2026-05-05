@@ -19,6 +19,19 @@ use magnus::value::Lazy;
 use magnus::{data_type_builder, method, Error, RClass, RString, Ruby, Value};
 
 // ---------------------------------------------------------------------------
+// FFI declarations
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    fn rb_thread_call_without_gvl(
+        func: unsafe extern "C" fn(data: *mut std::ffi::c_void) -> *mut std::ffi::c_void,
+        data: *mut std::ffi::c_void,
+        ubf: *const std::ffi::c_void,
+        ubf_data: *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+}
+
+// ---------------------------------------------------------------------------
 // SharableStringIO struct
 // ---------------------------------------------------------------------------
 
@@ -321,6 +334,228 @@ impl SharableStringIO {
     pub fn buffer_arc(&self) -> Arc<Mutex<Vec<u8>>> {
         Arc::clone(&self.buffer)
     }
+
+    /// Ruby: `sharable_string_io.write_to_file(path, offset: 0)`
+    ///
+    /// Writes the entire buffer directly to a file at the given byte offset.
+    /// The write happens in Rust with the GVL released — bytes never cross
+    /// into Ruby. This is the fastest path for dumping a response body to disk.
+    ///
+    /// When a fiber scheduler is active, releasing the GVL allows the scheduler
+    /// to run other fibers while the write completes.
+    fn rb_write_to_file(
+        rb_self: typed_data::Obj<Self>,
+        args: &[Value],
+    ) -> Result<usize, Error> {
+        let parsed =
+            scan_args::<(String,), (), (), (), magnus::RHash, ()>(args)?;
+        let path = parsed.required.0;
+
+        // Extract keyword arguments
+        let kwargs = magnus::scan_args::get_kwargs::<_, (), (Option<i64>,), ()>(
+            parsed.keywords,
+            &[],
+            &["offset"],
+        )?;
+        let offset = kwargs.optional.0.unwrap_or(0);
+        if offset < 0 {
+            return Err(Error::new(
+                magnus::exception::arg_error(),
+                "offset must be non-negative",
+            ));
+        }
+        let offset = offset as u64;
+
+        // Copy the buffer data while holding the lock (fast memcpy)
+        let data = {
+            let buf = rb_self.buffer.lock().map_err(|_| {
+                Error::new(
+                    magnus::exception::runtime_error(),
+                    "SharableStringIO buffer lock poisoned",
+                )
+            })?;
+            buf.clone()
+        };
+
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        // Prepare data for the GVL-free write
+        let path_c = std::ffi::CString::new(path.as_str())
+            .map_err(|_| Error::new(magnus::exception::arg_error(), "path contains null byte"))?;
+
+        struct WriteData {
+            path: std::ffi::CString,
+            data: Vec<u8>,
+            offset: u64,
+            result: std::result::Result<usize, std::io::Error>,
+        }
+
+        let mut write_data = WriteData {
+            path: path_c,
+            data,
+            offset,
+            result: Ok(0),
+        };
+
+        unsafe extern "C" fn do_write(ptr: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+            let wd = &mut *(ptr as *mut WriteData);
+            wd.result = (|| {
+                use std::fs::OpenOptions;
+                use std::io::{Seek, SeekFrom, Write};
+
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .open(wd.path.to_str().unwrap())?;
+
+                if wd.offset > 0 {
+                    file.seek(SeekFrom::Start(wd.offset))?;
+                }
+                file.write_all(&wd.data)?;
+                Ok(wd.data.len())
+            })();
+            std::ptr::null_mut()
+        }
+
+        // Release GVL during the file write — enables fiber scheduler to
+        // switch to other fibers while this one blocks on I/O.
+        unsafe {
+            rb_thread_call_without_gvl(
+                do_write,
+                &mut write_data as *mut WriteData as *mut std::ffi::c_void,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+        }
+
+        write_data.result.map_err(|e| {
+            Error::new(
+                magnus::exception::io_error(),
+                format!("write_to_file failed: {}", e),
+            )
+        })
+    }
+
+    /// Ruby: `sharable_string_io.write_to_io(io, offset: 0)`
+    ///
+    /// Writes the entire buffer to an IO object (File, Socket, etc.) using
+    /// its file descriptor. The write happens in Rust with the GVL released.
+    /// Falls back to calling `io.write` in Ruby if the IO doesn't have a
+    /// usable file descriptor (e.g. StringIO).
+    ///
+    /// The `offset` parameter seeks the destination IO to that position
+    /// before writing (only supported for seekable IOs like File).
+    fn rb_write_to_io(
+        ruby: &Ruby,
+        rb_self: typed_data::Obj<Self>,
+        args: &[Value],
+    ) -> Result<usize, Error> {
+        let parsed =
+            scan_args::<(Value,), (), (), (), magnus::RHash, ()>(args)?;
+        let io_val = parsed.required.0;
+
+        // Extract keyword arguments
+        let kwargs = magnus::scan_args::get_kwargs::<_, (), (Option<i64>,), ()>(
+            parsed.keywords,
+            &[],
+            &["offset"],
+        )?;
+        let offset = kwargs.optional.0.unwrap_or(0);
+        if offset < 0 {
+            return Err(Error::new(
+                magnus::exception::arg_error(),
+                "offset must be non-negative",
+            ));
+        }
+        let offset = offset as u64;
+
+        // Copy the buffer data while holding the lock
+        let data = {
+            let buf = rb_self.buffer.lock().map_err(|_| {
+                Error::new(
+                    magnus::exception::runtime_error(),
+                    "SharableStringIO buffer lock poisoned",
+                )
+            })?;
+            buf.clone()
+        };
+
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        // Try to get the file descriptor from the IO object via #fileno
+        let fd_result: Result<i32, _> = io_val.funcall("fileno", ());
+
+        match fd_result {
+            Ok(fd) => {
+                // We have a real fd — write directly without GVL
+                struct WriteIoData {
+                    fd: i32,
+                    data: Vec<u8>,
+                    offset: u64,
+                    result: std::result::Result<usize, std::io::Error>,
+                }
+
+                let mut write_data = WriteIoData {
+                    fd,
+                    data,
+                    offset,
+                    result: Ok(0),
+                };
+
+                unsafe extern "C" fn do_write_fd(
+                    ptr: *mut std::ffi::c_void,
+                ) -> *mut std::ffi::c_void {
+                    let wd = &mut *(ptr as *mut WriteIoData);
+                    wd.result = (|| {
+                        use std::io::Write;
+                        use std::os::fd::FromRawFd;
+
+                        // Borrow the fd without taking ownership (don't close on drop)
+                        let file = std::fs::File::from_raw_fd(wd.fd);
+                        let mut file = std::mem::ManuallyDrop::new(file);
+
+                        if wd.offset > 0 {
+                            use std::io::{Seek, SeekFrom};
+                            file.seek(SeekFrom::Start(wd.offset))?;
+                        }
+                        file.write_all(&wd.data)?;
+                        Ok(wd.data.len())
+                    })();
+                    std::ptr::null_mut()
+                }
+
+                unsafe {
+                    rb_thread_call_without_gvl(
+                        do_write_fd,
+                        &mut write_data as *mut WriteIoData as *mut std::ffi::c_void,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    );
+                }
+
+                write_data.result.map_err(|e| {
+                    Error::new(
+                        magnus::exception::io_error(),
+                        format!("write_to_io failed: {}", e),
+                    )
+                })
+            }
+            Err(_) => {
+                // No fd available (e.g. StringIO) — fall back to Ruby IO#write
+                // Seek if offset > 0
+                if offset > 0 {
+                    let _: Value = io_val.funcall("seek", (offset as i64,))?;
+                }
+                let rb_str = ruby.str_from_slice(&data);
+                let written: usize = io_val.funcall("write", (rb_str,))?;
+                Ok(written)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +620,8 @@ pub fn define_sharable_string_io(
     class.define_method("tell", method!(SharableStringIO::rb_pos, 0))?;
     class.define_method("pos=", method!(SharableStringIO::rb_set_pos, 1))?;
     class.define_method("closed?", method!(SharableStringIO::rb_closed, 0))?;
+    class.define_method("write_to_file", method!(SharableStringIO::rb_write_to_file, -1))?;
+    class.define_method("write_to_io", method!(SharableStringIO::rb_write_to_io, -1))?;
 
     Ok(())
 }

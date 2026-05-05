@@ -227,6 +227,31 @@ contention. Bytes only cross into Ruby when you call `read`.
 `streaming_io: true` and a block are mutually exclusive — passing both raises
 `ArgumentError`.
 
+#### Zero-copy file writes
+
+`SharableStringIO` can write its buffer directly to a file or IO without
+allocating a Ruby String. The write happens in Rust with the GVL released,
+so other threads and fibers can run concurrently.
+
+```ruby
+# Write entire response body to a file (bytes go Rust → kernel, never touch Ruby)
+body_io.write_to_file("/tmp/response.bin")
+
+# Write at a byte offset (useful for parallel range downloads)
+body_io.write_to_file(path, offset: range_start)
+
+# Write to an open IO object (uses the fd directly when available)
+File.open(path, "r+b") do |f|
+  body_io.write_to_io(f, offset: byte_offset)
+end
+
+# Falls back to io.write for non-fd IOs like StringIO
+buf = StringIO.new
+body_io.write_to_io(buf)
+```
+
+Both methods return the number of bytes written.
+
 #### Error classes
 
 HTTP errors inherit from `AwsCrt::Http::Error`:

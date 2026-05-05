@@ -7,6 +7,8 @@
 # instances with known content via `streaming_io: true`.
 
 require "socket"
+require "tmpdir"
+require "stringio"
 
 RSpec.describe AwsCrt::Http::SharableStringIO do
   # A minimal HTTP/1.1 server that returns a configurable response body.
@@ -311,6 +313,102 @@ RSpec.describe AwsCrt::Http::SharableStringIO do
         sio = AwsCrt::Http::SharableStringIO.new
         expect(sio.closed?).to be true
       end
+    end
+  end
+
+  describe "#write_to_file" do
+    it "writes the entire buffer to a file" do
+      sio = create_sio_with_content("Hello, file!")
+      path = File.join(Dir.tmpdir, "sio_write_test_#{$$}")
+      begin
+        bytes_written = sio.write_to_file(path)
+        expect(bytes_written).to eq(12)
+        expect(File.binread(path)).to eq("Hello, file!")
+      ensure
+        File.delete(path) if File.exist?(path)
+      end
+    end
+
+    it "writes at a byte offset" do
+      content = "ABCDEFGH"
+      sio = create_sio_with_content(content)
+      path = File.join(Dir.tmpdir, "sio_offset_test_#{$$}")
+      begin
+        # Pre-fill the file with zeros
+        File.binwrite(path, "\x00" * 16)
+        sio.write_to_file(path, offset: 4)
+        result = File.binread(path)
+        expect(result[4, 8]).to eq("ABCDEFGH")
+        expect(result[0, 4]).to eq("\x00" * 4)
+      ensure
+        File.delete(path) if File.exist?(path)
+      end
+    end
+
+    it "returns 0 for an empty buffer" do
+      sio = AwsCrt::Http::SharableStringIO.new
+      path = File.join(Dir.tmpdir, "sio_empty_test_#{$$}")
+      begin
+        expect(sio.write_to_file(path)).to eq(0)
+      ensure
+        File.delete(path) if File.exist?(path)
+      end
+    end
+
+    it "raises ArgumentError for negative offset" do
+      sio = create_sio_with_content("data")
+      expect { sio.write_to_file("/tmp/x", offset: -1) }.to raise_error(ArgumentError)
+    end
+  end
+
+  describe "#write_to_io" do
+    it "writes the entire buffer to an IO object" do
+      sio = create_sio_with_content("Hello, IO!")
+      path = File.join(Dir.tmpdir, "sio_io_test_#{$$}")
+      begin
+        File.open(path, "wb") do |f|
+          bytes_written = sio.write_to_io(f)
+          expect(bytes_written).to eq(10)
+        end
+        expect(File.binread(path)).to eq("Hello, IO!")
+      ensure
+        File.delete(path) if File.exist?(path)
+      end
+    end
+
+    it "writes at a byte offset in the IO" do
+      sio = create_sio_with_content("DATA")
+      path = File.join(Dir.tmpdir, "sio_io_offset_test_#{$$}")
+      begin
+        File.binwrite(path, "\x00" * 16)
+        File.open(path, "r+b") do |f|
+          sio.write_to_io(f, offset: 8)
+        end
+        result = File.binread(path)
+        expect(result[8, 4]).to eq("DATA")
+        expect(result[0, 8]).to eq("\x00" * 8)
+      ensure
+        File.delete(path) if File.exist?(path)
+      end
+    end
+
+    it "falls back to Ruby write for non-fd IOs like StringIO" do
+      sio = create_sio_with_content("fallback test")
+      target = StringIO.new
+      bytes_written = sio.write_to_io(target)
+      expect(bytes_written).to eq(13)
+      expect(target.string).to eq("fallback test")
+    end
+
+    it "returns 0 for an empty buffer" do
+      sio = AwsCrt::Http::SharableStringIO.new
+      target = StringIO.new
+      expect(sio.write_to_io(target)).to eq(0)
+    end
+
+    it "raises ArgumentError for negative offset" do
+      sio = create_sio_with_content("data")
+      expect { sio.write_to_io($stdout, offset: -1) }.to raise_error(ArgumentError)
     end
   end
 end
