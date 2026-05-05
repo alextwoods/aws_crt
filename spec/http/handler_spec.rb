@@ -354,8 +354,8 @@ RSpec.describe AwsCrt::Http::Handler do
     end
   end
 
-  describe "buffered path" do
-    it "buffers the full body and writes it at once when no response_target" do
+  describe "buffered path (streaming_io: true)" do
+    it "uses streaming_io: true and delivers the response body correctly" do
       body = "buffered-body"
       context = build_context(
         method: "POST",
@@ -373,9 +373,129 @@ RSpec.describe AwsCrt::Http::Handler do
       expect(resp.status_code).to eq(200)
       expect(resp.done).to be true
       expect(resp.body_chunks.size).to eq(1)
-      echo = JSON.parse(resp.body_chunks.first)
+      echo = JSON.parse(resp.body_string)
       expect(echo["method"]).to eq("POST")
       expect(echo["path"]).to eq("/buffered")
+    end
+
+    it "passes streaming_io: true to the CRT client request" do
+      context = build_context(
+        method: "GET",
+        path: "/streaming-io-check",
+        streaming: false
+      )
+
+      # Use a spy client that records the keyword arguments
+      received_kwargs = nil
+      # Create a real SharableStringIO via the echo server
+      real_client = make_client
+      _, _, sio = real_client.request(
+        "http://127.0.0.1:#{@port}", "GET", "/spy-setup",
+        [["Host", "127.0.0.1:#{@port}"]],
+        streaming_io: true
+      )
+
+      spy_client = Object.new
+      spy_client.define_singleton_method(:request) do |*args, **kwargs|
+        received_kwargs = kwargs
+        [200, [["Content-Type", "text/plain"]], sio]
+      end
+      context.config.crt_http_client = spy_client
+
+      handler = described_class.new
+      handler.call(context)
+
+      expect(received_kwargs).to eq({ streaming_io: true })
+    end
+
+    it "reads from the SharableStringIO and passes string data to signal_data" do
+      body = "sdk-read-test"
+      context = build_context(
+        method: "POST",
+        path: "/sdk-read",
+        headers: [["Content-Length", body.bytesize.to_s]],
+        body: StringIO.new(body),
+        streaming: false
+      )
+
+      # Capture the actual body data passed to signal_data
+      captured_data = nil
+      resp = context.http_response
+      original_signal_data = resp.method(:signal_data)
+      resp.define_singleton_method(:signal_data) do |data|
+        captured_data = data
+        original_signal_data.call(data)
+      end
+
+      handler = described_class.new
+      handler.call(context)
+
+      expect(resp.error).to be_nil, "unexpected error: #{resp.error.inspect}"
+      # The data passed to signal_data is a String (read from SharableStringIO)
+      expect(captured_data).to be_a(String)
+      expect(captured_data.encoding).to eq(Encoding::ASCII_8BIT)
+
+      echo = JSON.parse(captured_data)
+      expect(echo["body"]).to eq("sdk-read-test")
+    end
+
+    it "does not call signal_data for empty response body" do
+      # Use HEAD which returns no body from our echo server
+      context = build_context(
+        method: "HEAD",
+        path: "/empty-body",
+        streaming: false
+      )
+
+      handler = described_class.new
+      handler.call(context)
+
+      resp = context.http_response
+      expect(resp.error).to be_nil, "unexpected error: #{resp.error.inspect}"
+      expect(resp.status_code).to eq(200)
+      expect(resp.done).to be true
+      # No signal_data should be called for empty body
+      expect(resp.body_chunks).to be_empty
+    end
+
+    it "SharableStringIO response body supports the SDK read interface" do
+      # Verify that the SharableStringIO returned by the CRT client
+      # supports the interface the SDK expects for response bodies
+      body_content = "hello from CRT"
+      client = make_client
+      _, _, sio = client.request(
+        "http://127.0.0.1:#{@port}", "POST", "/sio-interface-test",
+        [["Host", "127.0.0.1:#{@port}"], ["Content-Length", body_content.bytesize.to_s]],
+        body_content,
+        streaming_io: true
+      )
+
+      # The SharableStringIO contains the echo server's JSON response
+      full_body = sio.read
+      expect(full_body).not_to be_empty
+
+      # SDK reads the full body
+      sio.rewind
+      expect(sio.read).to eq(full_body)
+
+      # SDK rewinds and reads again
+      sio.rewind
+      expect(sio.read).to eq(full_body)
+
+      # SDK reads in chunks
+      sio.rewind
+      chunk = sio.read(5)
+      expect(chunk.bytesize).to eq(5)
+      expect(chunk.encoding).to eq(Encoding::ASCII_8BIT)
+
+      # SDK checks size
+      expect(sio.size).to eq(full_body.bytesize)
+
+      # SDK checks eof
+      sio.rewind
+      expect(sio.eof?).to be false
+      sio.read
+      expect(sio.eof?).to be true
     end
   end
 

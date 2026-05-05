@@ -201,7 +201,31 @@ status, headers = client.request(
 ) do |chunk|
   # process each chunk as it arrives
 end
+
+# streaming_io response — returns a Ractor-safe SharableStringIO
+status, headers, body_io = client.request(
+  "https://example.com", "GET", "/data",
+  [["Host", "example.com"]],
+  streaming_io: true
+)
+
+body_io.read       # => all response bytes (ASCII-8BIT)
+body_io.size       # => total byte count
+body_io.rewind     # => reset read position to 0
+body_io.read(1024) # => read up to 1024 bytes
+body_io.eof?       # => true when fully consumed
+body_io.frozen?    # => true (always frozen)
+Ractor.shareable?(body_io) # => true
 ```
+
+The `streaming_io: true` option returns an `AwsCrt::Http::SharableStringIO`
+instead of a plain String. This is a read-only, frozen, Ractor-shareable IO
+object backed by a native Rust buffer. Response bytes accumulate in Rust
+without crossing the Ruby boundary during the HTTP response, minimizing GVL
+contention. Bytes only cross into Ruby when you call `read`.
+
+`streaming_io: true` and a block are mutually exclusive — passing both raises
+`ArgumentError`.
 
 #### Error classes
 
@@ -602,6 +626,19 @@ ractors = 4.times.map do |i|
   end
 end
 results = ractors.map(&:take)
+
+# streaming_io with Ractors — SharableStringIO crosses the boundary safely
+ractor = Ractor.new(client) do |c|
+  _status, _headers, body_io = c.request(
+    "http://example.com", "GET", "/data",
+    [["Host", "example.com"]],
+    streaming_io: true
+  )
+  body_io  # SharableStringIO is frozen and Ractor-shareable
+end
+
+body_io = ractor.value
+body_io.read  # => response bytes, read in the main Ractor
 ```
 
 ### Choosing the right component

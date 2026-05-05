@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use magnus::prelude::*;
 use magnus::rb_sys::AsRawValue;
-use magnus::scan_args::scan_args;
+use magnus::scan_args::{get_kwargs, scan_args};
 use magnus::typed_data::{self, DataType, DataTypeFunctions, TypedData};
 use magnus::value::Lazy;
 use magnus::{data_type_builder, method, Error, RArray, RClass, RHash, RString, Ruby, Symbol, Value};
@@ -22,6 +22,7 @@ use rb_sys::VALUE;
 use crate::connection_manager::{ConnectionManager, ConnectionManagerOptions};
 use crate::http;
 use crate::proxy::{ProxyAuthType, ProxyOptions};
+use crate::sharable_string_io::SharableStringIO;
 use crate::tls::TlsOptions;
 
 // ---------------------------------------------------------------------------
@@ -125,21 +126,38 @@ impl HttpClient {
         Ok(typed_data::Obj::wrap(client))
     }
 
-    /// Ruby: `client.request(endpoint, method, path, headers, body = nil, &block)`
+    /// Ruby: `client.request(endpoint, method, path, headers, body = nil, streaming_io: false, &block)`
     ///
     /// Buffered: returns [status_code, headers_array, body_string]
     /// Streaming (block given): returns [status_code, headers_array]
+    /// streaming_io: returns [status_code, headers_array, sharable_string_io]
     fn rb_request(
         ruby: &Ruby,
         rb_self: typed_data::Obj<Self>,
         args: &[Value],
     ) -> Result<Value, Error> {
-        let args = scan_args::<(String, String, String, RArray), (Option<RString>,), (), (), (), ()>(args)?;
+        let args = scan_args::<(String, String, String, RArray), (Option<RString>,), (), (), RHash, ()>(args)?;
         let endpoint = args.required.0;
         let method = args.required.1;
         let path = args.required.2;
         let headers = args.required.3;
         let body = args.optional.0;
+
+        // Extract keyword arguments
+        let kwargs = get_kwargs::<_, (), (Option<bool>,), ()>(args.keywords, &[], &["streaming_io"])?;
+        let (streaming_io_opt,) = kwargs.optional;
+        let streaming_io = streaming_io_opt.unwrap_or(false);
+
+        // Check if a block was given
+        let block = ruby.block_given();
+
+        // Validate: streaming_io and block are mutually exclusive
+        if streaming_io && block {
+            return Err(Error::new(
+                magnus::exception::arg_error(),
+                "streaming_io and block are mutually exclusive",
+            ));
+        }
 
         // Get or create connection manager for this endpoint
         let cm_ptr = rb_self.get_or_create_pool(&endpoint)?;
@@ -181,10 +199,32 @@ impl HttpClient {
             _ => None,
         };
 
-        // Check if a block was given
-        let block = ruby.block_given();
+        if streaming_io {
+            // streaming_io path: use make_request (buffered), then wrap body
+            // in a SharableStringIO. The CRT callbacks already handle
+            // Content-Length pre-allocation in the buffered path.
+            let response = http::make_request(
+                cm_ptr,
+                &method,
+                &path,
+                &header_vec,
+                body_bytes,
+                read_timeout_ms,
+            )
+            .map_err(|e| -> Error { e.into() })?;
 
-        if block {
+            let rb_headers = build_ruby_headers(ruby, &response.headers);
+
+            // Create a SharableStringIO with the response body (zero-copy move)
+            let sio = SharableStringIO::new_with_buffer(response.body);
+
+            let arr = RArray::from_slice(&[
+                ruby.into_value(response.status_code),
+                rb_headers.as_value(),
+                sio.as_value(),
+            ]);
+            Ok(arr.as_value())
+        } else if block {
             let block_proc = ruby.block_proc()?;
 
             let mut captured_status: i32 = 0;

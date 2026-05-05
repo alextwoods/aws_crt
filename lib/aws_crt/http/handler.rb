@@ -49,9 +49,9 @@ module AwsCrt
       def buffer_response(client, endpoint, method, path, headers, body, resp) # rubocop:disable Metrics/ParameterLists
         args = [endpoint, method, path, headers]
         args << body unless body.nil?
-        status, resp_headers, resp_body = client.request(*args)
+        status, resp_headers, resp_body = client.request(*args, streaming_io: true)
         resp.signal_headers(status, headers_to_hash(resp_headers))
-        resp.signal_data(resp_body) unless resp_body.empty?
+        resp.signal_data(resp_body.read) unless resp_body.size.zero?
         resp.signal_done
       end
 

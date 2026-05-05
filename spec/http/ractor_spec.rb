@@ -209,6 +209,210 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
     end
   end
 
+  describe "SharableStringIO Ractor support" do
+    describe "sending SharableStringIO between Ractors" do
+      it "can send a SharableStringIO from one Ractor to another" do
+        with_echo_server do |port|
+          client = AwsCrt::Http::Client.new
+          client.freeze
+
+          # Create a SharableStringIO in one Ractor, send it to another for reading
+          producer = Ractor.new(client, port) do |c, p|
+            _status, _headers, sio = c.request(
+              "http://127.0.0.1:#{p}",
+              "GET", "/sio-transfer",
+              [["Host", "127.0.0.1:#{p}"]],
+              streaming_io: true
+            )
+            sio
+          end
+
+          sio = producer.value
+
+          # Send the SharableStringIO to a consumer Ractor
+          consumer = Ractor.new(sio) do |io|
+            io.read
+          end
+
+          body = consumer.value
+          expect(body).to include("GET /sio-transfer")
+        end
+      end
+
+      it "SharableStringIO is Ractor.shareable?" do
+        with_echo_server do |port|
+          client = AwsCrt::Http::Client.new
+          client.freeze
+
+          result = Ractor.new(client, port) do |c, p|
+            _status, _headers, sio = c.request(
+              "http://127.0.0.1:#{p}",
+              "GET", "/shareable-check",
+              [["Host", "127.0.0.1:#{p}"]],
+              streaming_io: true
+            )
+            [Ractor.shareable?(sio), sio.frozen?]
+          end.value
+
+          shareable, frozen = result
+          expect(shareable).to be true
+          expect(frozen).to be true
+        end
+      end
+    end
+
+    describe "multiple Ractors sharing a client with streaming_io" do
+      it "each Ractor gets its own independent SharableStringIO" do
+        with_echo_server do |port|
+          client = AwsCrt::Http::Client.new
+          client.freeze
+
+          ractor_count = 4
+          ractors = ractor_count.times.map do |i|
+            Ractor.new(client, port, i) do |c, p, idx|
+              _status, _headers, sio = c.request(
+                "http://127.0.0.1:#{p}",
+                "GET", "/streaming-#{idx}",
+                [["Host", "127.0.0.1:#{p}"]],
+                streaming_io: true
+              )
+              [idx, sio.read, sio.size]
+            end
+          end
+
+          results = ractors.map(&:value)
+
+          expect(results.size).to eq(ractor_count)
+          results.each do |idx, body, size|
+            expect(body).to include("GET /streaming-#{idx}")
+            expect(size).to eq(body.bytesize)
+          end
+        end
+      end
+
+      it "SharableStringIO instances from different Ractors are independent" do
+        with_echo_server do |port|
+          client = AwsCrt::Http::Client.new
+          client.freeze
+
+          # Create SharableStringIO instances in separate Ractors
+          ractors = 3.times.map do |i|
+            Ractor.new(client, port, i) do |c, p, idx|
+              _status, _headers, sio = c.request(
+                "http://127.0.0.1:#{p}",
+                "GET", "/independent-#{idx}",
+                [["Host", "127.0.0.1:#{p}"]],
+                streaming_io: true
+              )
+              sio
+            end
+          end
+
+          sios = ractors.map(&:value)
+
+          # Each SharableStringIO should have different content
+          bodies = sios.map(&:read)
+          bodies.each_with_index do |body, i|
+            expect(body).to include("GET /independent-#{i}")
+          end
+
+          # Reading one doesn't affect the others
+          sios.each(&:rewind)
+          sios.each_with_index do |sio, i|
+            expect(sio.read).to include("GET /independent-#{i}")
+          end
+        end
+      end
+    end
+
+    describe "concurrent reads from multiple Ractors on the same SharableStringIO" do
+      it "multiple Ractors can read the same SharableStringIO without corruption" do
+        with_echo_server do |port|
+          client = AwsCrt::Http::Client.new
+          client.freeze
+
+          # Create a SharableStringIO with known content
+          _status, _headers, sio = client.request(
+            "http://127.0.0.1:#{port}",
+            "GET", "/shared-read",
+            [["Host", "127.0.0.1:#{port}"]],
+            streaming_io: true
+          )
+
+          expected_content = sio.read
+          sio.rewind
+
+          # Multiple Ractors read the same SharableStringIO concurrently
+          ractor_count = 4
+          ractors = ractor_count.times.map do
+            Ractor.new(sio) do |io|
+              # Each Ractor has its own read position (pos is per-call via AtomicUsize),
+              # but since the object is shared, we rewind and read to verify no corruption.
+              # Note: with shared state, each Ractor's rewind/read may interleave,
+              # but the data itself should never be corrupted.
+              io.rewind
+              io.read
+            end
+          end
+
+          results = ractors.map(&:value)
+
+          # All Ractors should get the same non-corrupted content
+          results.each do |body|
+            expect(body).to eq(expected_content)
+          end
+        end
+      end
+
+      it "concurrent partial reads from multiple Ractors produce non-corrupted data" do
+        with_echo_server do |port|
+          client = AwsCrt::Http::Client.new
+          client.freeze
+
+          # Create a SharableStringIO with known content
+          _status, _headers, sio = client.request(
+            "http://127.0.0.1:#{port}",
+            "GET", "/concurrent-partial",
+            [["Host", "127.0.0.1:#{port}"]],
+            streaming_io: true
+          )
+
+          full_content = sio.string
+
+          # Multiple Ractors do partial reads concurrently.
+          # Since pos is shared (AtomicUsize), interleaving is expected,
+          # but each individual read chunk must contain valid bytes from the buffer.
+          ractor_count = 4
+          ractors = ractor_count.times.map do
+            Ractor.new(sio) do |io|
+              io.rewind
+              chunks = []
+              chunk_size = 4
+              loop do
+                chunk = io.read(chunk_size)
+                break if chunk.nil?
+                chunks << chunk
+              end
+              chunks
+            end
+          end
+
+          results = ractors.map(&:value)
+
+          # Verify no corruption: every byte in every chunk must exist
+          # in the original buffer at some valid position. Each chunk must
+          # be a contiguous slice of the original buffer.
+          results.each do |chunks|
+            chunks.each do |chunk|
+              # Each chunk should be a contiguous subsequence of full_content
+              expect(full_content).to include(chunk)
+            end
+          end
+        end
+      end
+    end
+  end
+
   describe "error handling in Ractors" do
     it "propagates CRT errors from non-main Ractors" do
       client = AwsCrt::Http::Client.new
