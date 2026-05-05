@@ -375,11 +375,14 @@ impl SignedHttpClient {
             send_result.map_err(|e| -> Error { e.into() })?;
 
             let rb_headers = build_ruby_headers(ruby, &captured_headers);
-            let arr = RArray::from_slice(&[
-                ruby.into_value(captured_status),
-                rb_headers.as_value(),
-            ]);
-            Ok(arr.as_value())
+            let resp_obj = crate::http_response::HttpResponse::new_from_parts(
+                captured_status,
+                rb_headers.as_raw(),
+                ruby.qnil().as_value().as_raw(),
+                None,
+                None,
+            );
+            Ok(resp_obj.as_value())
         } else {
             let response = unsafe {
                 http::send_pre_built_request(
@@ -394,12 +397,14 @@ impl SignedHttpClient {
 
             let rb_headers = build_ruby_headers(ruby, &response.headers);
             let rb_body = ruby.str_from_slice(&response.body);
-            let arr = RArray::from_slice(&[
-                ruby.into_value(response.status_code),
-                rb_headers.as_value(),
-                rb_body.as_value(),
-            ]);
-            Ok(arr.as_value())
+            let resp_obj = crate::http_response::HttpResponse::new_from_parts(
+                response.status_code,
+                rb_headers.as_raw(),
+                rb_body.as_value().as_raw(),
+                None,
+                None,
+            );
+            Ok(resp_obj.as_value())
         }
     }
 }
@@ -599,16 +604,30 @@ fn parse_proxy_options(opts: &RHash) -> Result<Option<ProxyOptions>, Error> {
     }
 }
 
-fn build_ruby_headers(ruby: &Ruby, headers: &[(String, String)]) -> RArray {
-    let arr = RArray::with_capacity(headers.len());
+fn build_ruby_headers(ruby: &Ruby, headers: &[(String, String)]) -> RHash {
+    let hash = RHash::new();
     for (name, value) in headers {
-        let pair = RArray::from_slice(&[
-            ruby.str_new(name).as_value(),
-            ruby.str_new(value).as_value(),
-        ]);
-        let _ = arr.push(pair);
+        let rb_name = ruby.str_new(name);
+        let rb_value = ruby.str_new(value);
+        // Check if the key already exists; if so, merge with ", "
+        let existing: Option<Value> = hash.lookup(rb_name.as_value()).unwrap_or(None);
+        match existing {
+            Some(v) if !v.is_nil() => {
+                // Merge: "existing_value, new_value"
+                let existing_str = RString::from_value(v).unwrap();
+                let merged = format!(
+                    "{}, {}",
+                    unsafe { std::str::from_utf8_unchecked(existing_str.as_slice()) },
+                    value
+                );
+                let _ = hash.aset(rb_name.as_value(), ruby.str_new(&merged).as_value());
+            }
+            _ => {
+                let _ = hash.aset(rb_name.as_value(), rb_value.as_value());
+            }
+        }
     }
-    arr
+    hash
 }
 
 // ---------------------------------------------------------------------------

@@ -57,17 +57,18 @@ RSpec.describe AwsCrt::SignedHttpClient do
 
     let(:client) { described_class.new(service: "sts") }
 
-    it "signs and sends a GET request, returning status, headers, and body" do
+    it "signs and sends a GET request, returning an HttpResponse" do
       headers = [["host", "127.0.0.1:#{server.port}"]]
 
-      status, resp_headers, body = client.request(
+      response = client.request(
         endpoint, "GET", "/hello", headers, nil, **credentials
       )
 
-      expect(status).to eq(200)
-      expect(body).to include("GET")
-      expect(body).to include("/hello")
-      expect(resp_headers).to be_an(Array)
+      expect(response).to be_a(AwsCrt::Http::Response)
+      expect(response.status_code).to eq(200)
+      expect(response.body).to include("GET")
+      expect(response.body).to include("/hello")
+      expect(response.headers).to be_a(Hash)
     end
 
     it "signs and sends a POST request with a body" do
@@ -78,63 +79,63 @@ RSpec.describe AwsCrt::SignedHttpClient do
         ["content-length", body_content.bytesize.to_s]
       ]
 
-      status, _resp_headers, body = client.request(
+      response = client.request(
         endpoint, "POST", "/", headers, body_content, **credentials
       )
 
-      expect(status).to eq(200)
-      expect(body).to include("POST")
-      expect(body).to include(body_content)
+      expect(response.status_code).to eq(200)
+      expect(response.body).to include("POST")
+      expect(response.body).to include(body_content)
     end
 
     it "adds SigV4 signing headers to the request" do
       headers = [["host", "127.0.0.1:#{server.port}"]]
 
-      _status, _resp_headers, body = client.request(
+      response = client.request(
         endpoint, "GET", "/signed", headers, nil, **credentials
       )
 
       # The echo server returns the request headers in the JSON body.
       # SigV4 signing should have added Authorization and X-Amz-Date.
-      expect(body).to include("Authorization")
-      expect(body).to include("AWS4-HMAC-SHA256")
-      expect(body).to include("X-Amz-Date")
+      expect(response.body).to include("Authorization")
+      expect(response.body).to include("AWS4-HMAC-SHA256")
+      expect(response.body).to include("X-Amz-Date")
     end
 
     it "includes x-amz-content-sha256 header by default" do
       headers = [["host", "127.0.0.1:#{server.port}"]]
 
-      _status, _resp_headers, body = client.request(
+      response = client.request(
         endpoint, "GET", "/sha256", headers, nil, **credentials
       )
 
-      expect(body).to include("x-amz-content-sha256")
+      expect(response.body).to include("x-amz-content-sha256")
     end
 
     it "includes session token when provided" do
       headers = [["host", "127.0.0.1:#{server.port}"]]
       creds_with_token = credentials.merge(session_token: "MySessionToken123")
 
-      _status, _resp_headers, body = client.request(
+      response = client.request(
         endpoint, "GET", "/token", headers, nil, **creds_with_token
       )
 
-      expect(body).to include("X-Amz-Security-Token")
-      expect(body).to include("MySessionToken123")
+      expect(response.body).to include("X-Amz-Security-Token")
+      expect(response.body).to include("MySessionToken123")
     end
 
     it "streams the response body when a block is given" do
       headers = [["host", "127.0.0.1:#{server.port}"]]
 
       chunks = []
-      status, resp_headers = client.request(
+      response = client.request(
         endpoint, "GET", "/stream", headers, nil, **credentials
       ) do |chunk|
         chunks << chunk
       end
 
-      expect(status).to eq(200)
-      expect(resp_headers).to be_an(Array)
+      expect(response.status_code).to eq(200)
+      expect(response.headers).to be_a(Hash)
       expect(chunks.join).to include("GET")
       expect(chunks.join).to include("/stream")
     end
@@ -193,12 +194,12 @@ RSpec.describe AwsCrt::SignedHttpClient do
       client.freeze
 
       headers = [["host", "127.0.0.1:#{server.port}"]]
-      status, _, body = client.request(
+      response = client.request(
         endpoint, "GET", "/frozen", headers, nil, **credentials
       )
 
-      expect(status).to eq(200)
-      expect(body).to include("/frozen")
+      expect(response.status_code).to eq(200)
+      expect(response.body).to include("/frozen")
     end
   end
 
@@ -230,12 +231,12 @@ RSpec.describe AwsCrt::SignedHttpClient do
         )
         headers = [["host", "127.0.0.1:#{server.port}"]]
 
-        _status, _resp_headers, body = client.request(
+        response = client.request(
           endpoint, "GET", "/my-bucket/my-key", headers, nil, **credentials
         )
 
-        expect(body).to include("Authorization")
-        expect(body).to include("/s3/aws4_request")
+        expect(response.body).to include("Authorization")
+        expect(response.body).to include("/s3/aws4_request")
       end
     end
   end
@@ -253,10 +254,10 @@ RSpec.describe AwsCrt::SignedHttpClient do
       threads = 8.times.map do |i|
         Thread.new do
           headers = [["host", "127.0.0.1:#{server.port}"]]
-          status, _, body = client.request(
+          response = client.request(
             endpoint, "GET", "/thread-#{i}", headers, nil, **credentials
           )
-          results[i] = [status, body]
+          results[i] = [response.status_code, response.body]
         end
       end
       threads.each(&:join)
@@ -278,11 +279,11 @@ RSpec.describe AwsCrt::SignedHttpClient do
       client = described_class.new(service: "sts")
       headers = [["host", "127.0.0.1:#{server.port}"]]
 
-      status1, = client.request(endpoint, "GET", "/first", headers, nil, **credentials)
-      status2, = client.request(endpoint, "GET", "/second", headers, nil, **credentials)
+      r1 = client.request(endpoint, "GET", "/first", headers, nil, **credentials)
+      r2 = client.request(endpoint, "GET", "/second", headers, nil, **credentials)
 
-      expect(status1).to eq(200)
-      expect(status2).to eq(200)
+      expect(r1.status_code).to eq(200)
+      expect(r2.status_code).to eq(200)
     end
   end
 
@@ -297,7 +298,7 @@ RSpec.describe AwsCrt::SignedHttpClient do
       headers = [["host", "127.0.0.1:#{server.port}"]]
 
       # First request with one set of credentials
-      status1, _, body1 = client.request(
+      r1 = client.request(
         endpoint, "GET", "/call-1", headers, nil, **credentials
       )
 
@@ -306,18 +307,18 @@ RSpec.describe AwsCrt::SignedHttpClient do
         access_key_id: "AKIAOTHER7EXAMPLE",
         secret_access_key: "otherSecretKey123"
       )
-      status2, _, body2 = client.request(
+      r2 = client.request(
         endpoint, "GET", "/call-2", headers, nil, **other_creds
       )
 
-      expect(status1).to eq(200)
-      expect(status2).to eq(200)
-      expect(body1).to include("/call-1")
-      expect(body2).to include("/call-2")
+      expect(r1.status_code).to eq(200)
+      expect(r2.status_code).to eq(200)
+      expect(r1.body).to include("/call-1")
+      expect(r2.body).to include("/call-2")
 
       # Different credentials should produce different Authorization headers
-      auth1 = body1[/Authorization.*?(?=\\"|$)/]
-      auth2 = body2[/Authorization.*?(?=\\"|$)/]
+      auth1 = r1.body[/Authorization.*?(?=\\"|$)/]
+      auth2 = r2.body[/Authorization.*?(?=\\"|$)/]
       expect(auth1).not_to eq(auth2)
     end
   end

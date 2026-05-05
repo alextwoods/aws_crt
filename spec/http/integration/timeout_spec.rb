@@ -43,10 +43,10 @@ RSpec.describe "Timeout integration" do
 
     it "succeeds when the server responds within the read timeout" do
       # No delay — should complete well within 1 second
-      status, _headers, body = @timeout_client.request(@server.endpoint, "GET", "/fast", [host_header])
+      response = @timeout_client.request(@server.endpoint, "GET", "/fast", [host_header])
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("GET")
       expect(echo["path"]).to eq("/fast")
     end
@@ -72,10 +72,10 @@ RSpec.describe "Timeout integration" do
       # and complete normal requests without issue.
       client = AwsCrt::Http::Client.new
 
-      status, _headers, body = client.request(@server.endpoint, "GET", "/defaults", [host_header])
+      response = client.request(@server.endpoint, "GET", "/defaults", [host_header])
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("GET")
       expect(echo["path"]).to eq("/defaults")
     end

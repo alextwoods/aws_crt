@@ -85,12 +85,12 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
         client.freeze
 
         result = Ractor.new(client, port) do |c, p|
-          status, _headers, body = c.request(
+          response = c.request(
             "http://127.0.0.1:#{p}",
             "GET", "/from-ractor",
             [["Host", "127.0.0.1:#{p}"]]
           )
-          [status, body]
+          [response.status_code, response.body]
         end.value
 
         status, body = result
@@ -109,12 +109,12 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
         ractor_count = 4
         ractors = ractor_count.times.map do |i|
           Ractor.new(client, port, i) do |c, p, idx|
-            status, _headers, body = c.request(
+            response = c.request(
               "http://127.0.0.1:#{p}",
               "GET", "/ractor-#{idx}",
               [["Host", "127.0.0.1:#{p}"]]
             )
-            [idx, status, body]
+            [idx, response.status_code, response.body]
           end
         end
 
@@ -137,13 +137,13 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
         ractors = ractor_count.times.map do |i|
           Ractor.new(client, port, i) do |c, p, idx|
             body = "payload-#{idx}"
-            status, _headers, resp_body = c.request(
+            response = c.request(
               "http://127.0.0.1:#{p}",
               "POST", "/post-#{idx}",
               [["Host", "127.0.0.1:#{p}"], ["Content-Length", body.bytesize.to_s]],
               body
             )
-            [idx, status, resp_body]
+            [idx, response.status_code, response.body]
           end
         end
 
@@ -167,12 +167,12 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
         ractor_count = 4
         ractors = ractor_count.times.map do |i|
           Ractor.new(client, port, i) do |c, p, idx|
-            status, _headers, body = c.request(
+            response = c.request(
               "http://127.0.0.1:#{p}",
               "GET", "/shared-pool-#{idx}",
               [["Host", "127.0.0.1:#{p}"]]
             )
-            [idx, status, body]
+            [idx, response.status_code, response.body]
           end
         end
 
@@ -194,12 +194,12 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
 
         result = Ractor.new(client, port) do |c, p|
           chunks = []
-          status, _headers = c.request(
+          response = c.request(
             "http://127.0.0.1:#{p}",
             "GET", "/stream-ractor",
             [["Host", "127.0.0.1:#{p}"]]
           ) { |chunk| chunks << chunk }
-          [status, chunks.join]
+          [response.status_code, chunks.join]
         end.value
 
         status, body = result
@@ -218,13 +218,13 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
 
           # Create a SharableStringIO in one Ractor, send it to another for reading
           producer = Ractor.new(client, port) do |c, p|
-            _status, _headers, sio = c.request(
+            response = c.request(
               "http://127.0.0.1:#{p}",
               "GET", "/sio-transfer",
               [["Host", "127.0.0.1:#{p}"]],
               streaming_io: true
             )
-            sio
+            response.body
           end
 
           sio = producer.value
@@ -245,12 +245,13 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
           client.freeze
 
           result = Ractor.new(client, port) do |c, p|
-            _status, _headers, sio = c.request(
+            response = c.request(
               "http://127.0.0.1:#{p}",
               "GET", "/shareable-check",
               [["Host", "127.0.0.1:#{p}"]],
               streaming_io: true
             )
+            sio = response.body
             [Ractor.shareable?(sio), sio.frozen?]
           end.value
 
@@ -270,12 +271,13 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
           ractor_count = 4
           ractors = ractor_count.times.map do |i|
             Ractor.new(client, port, i) do |c, p, idx|
-              _status, _headers, sio = c.request(
+              response = c.request(
                 "http://127.0.0.1:#{p}",
                 "GET", "/streaming-#{idx}",
                 [["Host", "127.0.0.1:#{p}"]],
                 streaming_io: true
               )
+              sio = response.body
               [idx, sio.read, sio.size]
             end
           end
@@ -298,13 +300,13 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
           # Create SharableStringIO instances in separate Ractors
           ractors = 3.times.map do |i|
             Ractor.new(client, port, i) do |c, p, idx|
-              _status, _headers, sio = c.request(
+              response = c.request(
                 "http://127.0.0.1:#{p}",
                 "GET", "/independent-#{idx}",
                 [["Host", "127.0.0.1:#{p}"]],
                 streaming_io: true
               )
-              sio
+              response.body
             end
           end
 
@@ -332,12 +334,13 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
           client.freeze
 
           # Create a SharableStringIO with known content
-          _status, _headers, sio = client.request(
+          response = client.request(
             "http://127.0.0.1:#{port}",
             "GET", "/shared-read",
             [["Host", "127.0.0.1:#{port}"]],
             streaming_io: true
           )
+          sio = response.body
 
           expected_content = sio.read
           sio.rewind
@@ -346,10 +349,6 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
           ractor_count = 4
           ractors = ractor_count.times.map do
             Ractor.new(sio) do |io|
-              # Each Ractor has its own read position (pos is per-call via AtomicUsize),
-              # but since the object is shared, we rewind and read to verify no corruption.
-              # Note: with shared state, each Ractor's rewind/read may interleave,
-              # but the data itself should never be corrupted.
               io.rewind
               io.read
             end
@@ -370,18 +369,17 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
           client.freeze
 
           # Create a SharableStringIO with known content
-          _status, _headers, sio = client.request(
+          response = client.request(
             "http://127.0.0.1:#{port}",
             "GET", "/concurrent-partial",
             [["Host", "127.0.0.1:#{port}"]],
             streaming_io: true
           )
+          sio = response.body
 
           full_content = sio.string
 
           # Multiple Ractors do partial reads concurrently.
-          # Since pos is shared (AtomicUsize), interleaving is expected,
-          # but each individual read chunk must contain valid bytes from the buffer.
           ractor_count = 4
           ractors = ractor_count.times.map do
             Ractor.new(sio) do |io|
@@ -400,11 +398,9 @@ RSpec.describe "AwsCrt::Http::Client Ractor support" do
           results = ractors.map(&:value)
 
           # Verify no corruption: every byte in every chunk must exist
-          # in the original buffer at some valid position. Each chunk must
-          # be a contiguous slice of the original buffer.
+          # in the original buffer at some valid position.
           results.each do |chunks|
             chunks.each do |chunk|
-              # Each chunk should be a contiguous subsequence of full_content
               expect(full_content).to include(chunk)
             end
           end

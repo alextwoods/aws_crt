@@ -387,9 +387,9 @@ RSpec.describe AwsCrt::Http::Handler do
 
       # Use a spy client that records the keyword arguments
       received_kwargs = nil
-      # Create a real SharableStringIO via the echo server
+      # Create a real response via the echo server
       real_client = make_client
-      _, _, sio = real_client.request(
+      real_response = real_client.request(
         "http://127.0.0.1:#{@port}", "GET", "/spy-setup",
         [["Host", "127.0.0.1:#{@port}"]],
         streaming_io: true
@@ -398,7 +398,7 @@ RSpec.describe AwsCrt::Http::Handler do
       spy_client = Object.new
       spy_client.define_singleton_method(:request) do |*args, **kwargs|
         received_kwargs = kwargs
-        [200, [["Content-Type", "text/plain"]], sio]
+        real_response
       end
       context.config.crt_http_client = spy_client
 
@@ -463,12 +463,13 @@ RSpec.describe AwsCrt::Http::Handler do
       # supports the interface the SDK expects for response bodies
       body_content = "hello from CRT"
       client = make_client
-      _, _, sio = client.request(
+      response = client.request(
         "http://127.0.0.1:#{@port}", "POST", "/sio-interface-test",
         [["Host", "127.0.0.1:#{@port}"], ["Content-Length", body_content.bytesize.to_s]],
         body_content,
         streaming_io: true
       )
+      sio = response.body
 
       # The SharableStringIO contains the echo server's JSON response
       full_body = sio.read

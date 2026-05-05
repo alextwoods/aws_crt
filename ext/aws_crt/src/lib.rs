@@ -8,6 +8,7 @@ pub mod credentials;
 pub mod error;
 pub mod http;
 pub mod http_client;
+pub mod http_response;
 pub mod proxy;
 pub mod runtime;
 pub mod s3_client;
@@ -28,6 +29,22 @@ mod crt {
     #[repr(C)]
     pub struct AwsAllocator {
         _private: [u8; 0],
+    }
+
+    /// Mirrors `struct aws_byte_cursor` for use with aws-c-cal hash functions.
+    #[repr(C)]
+    pub struct AwsByteCursor {
+        pub len: usize,
+        pub ptr: *const u8,
+    }
+
+    /// Mirrors `struct aws_byte_buf` for use with aws-c-cal hash functions.
+    #[repr(C)]
+    pub struct AwsByteBuf {
+        pub len: usize,
+        pub buffer: *mut u8,
+        pub capacity: usize,
+        pub allocator: *mut AwsAllocator,
     }
 
     extern "C" {
@@ -51,6 +68,30 @@ mod crt {
             length: usize,
             previous_crc64: u64,
         ) -> u64;
+
+        // aws-c-cal one-shot hash functions
+        pub fn aws_sha256_compute(
+            allocator: *mut AwsAllocator,
+            input: *const AwsByteCursor,
+            output: *mut AwsByteBuf,
+            truncate_to: usize,
+        ) -> i32;
+
+        pub fn aws_sha1_compute(
+            allocator: *mut AwsAllocator,
+            input: *const AwsByteCursor,
+            output: *mut AwsByteBuf,
+            truncate_to: usize,
+        ) -> i32;
+
+        // aws_byte_buf management
+        pub fn aws_byte_buf_init(
+            buf: *mut AwsByteBuf,
+            allocator: *mut AwsAllocator,
+            capacity: usize,
+        ) -> i32;
+
+        pub fn aws_byte_buf_clean_up(buf: *mut AwsByteBuf);
     }
 }
 
@@ -156,6 +197,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let http = module.define_module("Http")?;
     error::define_http_errors(ruby, &http)?;
     http_client::define_http_client(ruby, &http)?;
+    http_response::define_http_response(ruby, &http)?;
     sharable_string_io::define_sharable_string_io(ruby, &http)?;
 
     // S3 module

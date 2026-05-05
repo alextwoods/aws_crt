@@ -39,10 +39,10 @@ RSpec.describe "TLS integration" do
     end
 
     it "completes a GET request over HTTPS" do
-      status, _headers, body = @client.request(@server.endpoint, "GET", "/tls-test", [host_header])
+      response = @client.request(@server.endpoint, "GET", "/tls-test", [host_header])
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("GET")
       expect(echo["path"]).to eq("/tls-test")
     end
@@ -54,18 +54,18 @@ RSpec.describe "TLS integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @client.request(@server.endpoint, "POST", "/secure", request_headers, request_body)
+      response = @client.request(@server.endpoint, "POST", "/secure", request_headers, request_body)
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("POST")
       expect(echo["body"]).to eq("secure payload")
     end
 
     it "returns correct response headers over HTTPS" do
-      _status, headers, _body = @client.request(@server.endpoint, "GET", "/", [host_header])
+      response = @client.request(@server.endpoint, "GET", "/", [host_header])
 
-      header_hash = headers.to_h { |k, v| [k.downcase, v] }
+      header_hash = response.headers.transform_keys(&:downcase)
       expect(header_hash["content-type"]).to eq("application/json")
       expect(header_hash).to have_key("content-length")
     end

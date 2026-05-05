@@ -146,10 +146,10 @@ RSpec.describe "Property 2: Request/Response Round-Trip Fidelity" do
       body = random_body
       request_headers = headers + [["Content-Length", body.bytesize.to_s]]
 
-      status, _, resp_body = make_client.request("http://127.0.0.1:#{@port}", method, path, request_headers, body)
-      expect(status).to eq(200)
+      response = make_client.request("http://127.0.0.1:#{@port}", method, path, request_headers, body)
+      expect(response.status_code).to eq(200)
 
-      echo = JSON.parse(resp_body)
+      echo = JSON.parse(response.body)
       assert_echo_matches(echo, method: method, path: path, headers: headers, body: body)
     end
   end
@@ -161,10 +161,10 @@ RSpec.describe "Property 2: Request/Response Round-Trip Fidelity" do
       path = random_path
       headers = random_headers
 
-      status, _, resp_body = make_client.request("http://127.0.0.1:#{@port}", "GET", path, headers)
-      expect(status).to eq(200)
+      response = make_client.request("http://127.0.0.1:#{@port}", "GET", path, headers)
+      expect(response.status_code).to eq(200)
 
-      echo = JSON.parse(resp_body)
+      echo = JSON.parse(response.body)
       assert_echo_matches(echo, method: "GET", path: path, headers: headers)
       expect(echo["body"]).to eq(""),
                                "Expected empty body for GET, got #{echo["body"].inspect}"
@@ -178,12 +178,12 @@ RSpec.describe "Property 2: Request/Response Round-Trip Fidelity" do
       path = random_path
       headers = random_headers
 
-      status, _, resp_body = make_client.request("http://127.0.0.1:#{@port}", "HEAD", path, headers)
-      expect(status).to eq(200)
+      response = make_client.request("http://127.0.0.1:#{@port}", "HEAD", path, headers)
+      expect(response.status_code).to eq(200)
 
       # HEAD responses have no body per HTTP/1.1
-      expect(resp_body).to eq(""),
-                            "Expected empty body for HEAD, got #{resp_body.bytesize} bytes"
+      expect(response.body).to eq(""),
+                            "Expected empty body for HEAD, got #{response.body.bytesize} bytes"
     end
   end
 end

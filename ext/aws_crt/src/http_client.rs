@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use base64::Engine;
 use magnus::prelude::*;
 use magnus::rb_sys::{AsRawValue, FromRawValue};
 use magnus::scan_args::{get_kwargs, scan_args};
@@ -21,6 +22,7 @@ use rb_sys::VALUE;
 
 use crate::connection_manager::{ConnectionManager, ConnectionManagerOptions};
 use crate::http;
+use crate::http_response::HttpResponse as RubyHttpResponse;
 use crate::proxy::{ProxyAuthType, ProxyOptions};
 use crate::sharable_string_io::SharableStringIO;
 use crate::tls::TlsOptions;
@@ -126,11 +128,10 @@ impl HttpClient {
         Ok(typed_data::Obj::wrap(client))
     }
 
-    /// Ruby: `client.request(endpoint, method, path, headers, body = nil, streaming_io: false, &block)`
+    /// Ruby: `client.request(endpoint, method, path, headers, body = nil,
+    ///          streaming_io: false, on_data: nil, checksum_algorithms: nil, &block)`
     ///
-    /// Buffered: returns [status_code, headers_array, body_string]
-    /// Streaming (block given): returns [status_code, headers_array]
-    /// streaming_io: returns [status_code, headers_array, sharable_string_io]
+    /// Always returns an `AwsCrt::Http::Response` instance.
     fn rb_request(
         ruby: &Ruby,
         rb_self: typed_data::Obj<Self>,
@@ -144,8 +145,10 @@ impl HttpClient {
         let body = args.optional.0;
 
         // Extract keyword arguments
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<Value>), ()>(args.keywords, &[], &["streaming_io", "on_data"])?;
-        let (streaming_io_opt, on_data_opt) = kwargs.optional;
+        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<Value>, Option<Value>, Option<Value>), ()>(
+            args.keywords, &[], &["streaming_io", "on_data", "on_headers", "checksum_algorithms"]
+        )?;
+        let (streaming_io_opt, on_data_opt, on_headers_opt, checksum_algorithms_opt) = kwargs.optional;
         let streaming_io = streaming_io_opt.unwrap_or(false);
 
         // Extract on_data listeners (Array of Procs or nil)
@@ -158,6 +161,47 @@ impl HttpClient {
                     )
                 })?;
                 if arr.len() > 0 { Some(arr) } else { None }
+            }
+            _ => None,
+        };
+
+        // Extract on_headers listeners (Array of Procs or nil)
+        let on_headers_listeners: Option<RArray> = match on_headers_opt {
+            Some(v) if !v.is_nil() => {
+                let arr = RArray::from_value(v).ok_or_else(|| {
+                    Error::new(
+                        magnus::exception::type_error(),
+                        "on_headers must be an Array of callable objects",
+                    )
+                })?;
+                if arr.len() > 0 { Some(arr) } else { None }
+            }
+            _ => None,
+        };
+
+        // Extract checksum_algorithms (Array of Strings or nil)
+        let checksum_algorithms: Option<Vec<String>> = match checksum_algorithms_opt {
+            Some(v) if !v.is_nil() => {
+                let arr = RArray::from_value(v).ok_or_else(|| {
+                    Error::new(
+                        magnus::exception::type_error(),
+                        "checksum_algorithms must be an Array of Strings",
+                    )
+                })?;
+                let len = arr.len();
+                if len == 0 {
+                    None
+                } else {
+                    let mut algs = Vec::with_capacity(len);
+                    for i in 0..len {
+                        let val: Value = unsafe {
+                            Value::from_raw(*rb_sys::RARRAY_CONST_PTR(arr.as_raw()).add(i))
+                        };
+                        let s: String = magnus::TryConvert::try_convert(val)?;
+                        algs.push(s);
+                    }
+                    Some(algs)
+                }
             }
             _ => None,
         };
@@ -215,8 +259,7 @@ impl HttpClient {
 
         if streaming_io {
             // streaming_io path: use make_request (buffered), then wrap body
-            // in a SharableStringIO. The CRT callbacks already handle
-            // Content-Length pre-allocation in the buffered path.
+            // in a SharableStringIO.
             let response = http::make_request(
                 cm_ptr,
                 &method,
@@ -226,6 +269,25 @@ impl HttpClient {
                 read_timeout_ms,
             )
             .map_err(|e| -> Error { e.into() })?;
+
+            // Compute checksum over the body buffer
+            let (checksum_algorithm, computed_checksum) =
+                compute_checksum(&checksum_algorithms, &response.headers, &response.body);
+
+            let rb_headers = build_ruby_headers_hash(ruby, &response.headers);
+
+            // Call on_headers listeners
+            if let Some(ref listeners) = on_headers_listeners {
+                let status_val = ruby.into_value(response.status_code);
+                let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                let len = listeners.len();
+                for i in 0..len {
+                    let listener: Value = unsafe {
+                        Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                    };
+                    let _: Value = listener.funcall("call", (status_val, rb_headers_value))?;
+                }
+            }
 
             // Notify on_data listeners with the complete body
             if let Some(ref listeners) = on_data_listeners {
@@ -241,17 +303,17 @@ impl HttpClient {
                 }
             }
 
-            let rb_headers = build_ruby_headers(ruby, &response.headers);
-
             // Create a SharableStringIO with the response body (zero-copy move)
             let sio = SharableStringIO::new_with_buffer(response.body);
 
-            let arr = RArray::from_slice(&[
-                ruby.into_value(response.status_code),
-                rb_headers.as_value(),
-                sio.as_value(),
-            ]);
-            Ok(arr.as_value())
+            let resp_obj = RubyHttpResponse::new_from_parts(
+                response.status_code,
+                rb_headers.as_raw(),
+                sio.as_value().as_raw(),
+                checksum_algorithm,
+                computed_checksum,
+            );
+            Ok(resp_obj.as_value())
         } else if block {
             let block_proc = ruby.block_proc()?;
 
@@ -286,12 +348,30 @@ impl HttpClient {
             )
             .map_err(|e| -> Error { e.into() })?;
 
-            let rb_headers = build_ruby_headers(ruby, &captured_headers);
-            let arr = RArray::from_slice(&[
-                ruby.into_value(captured_status),
-                rb_headers.as_value(),
-            ]);
-            Ok(arr.as_value())
+            let rb_headers = build_ruby_headers_hash(ruby, &captured_headers);
+
+            // Call on_headers listeners
+            if let Some(ref listeners) = on_headers_listeners {
+                let status_val = ruby.into_value(captured_status);
+                let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                let len = listeners.len();
+                for i in 0..len {
+                    let listener: Value = unsafe {
+                        Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                    };
+                    let _: Value = listener.funcall("call", (status_val, rb_headers_value))?;
+                }
+            }
+
+            // Block streaming path: no native checksum computation
+            let resp_obj = RubyHttpResponse::new_from_parts(
+                captured_status,
+                rb_headers.as_raw(),
+                ruby.qnil().as_value().as_raw(),
+                None,
+                None,
+            );
+            Ok(resp_obj.as_value())
         } else {
             let response = http::make_request(
                 cm_ptr,
@@ -302,6 +382,25 @@ impl HttpClient {
                 read_timeout_ms,
             )
             .map_err(|e| -> Error { e.into() })?;
+
+            // Compute checksum over the body buffer
+            let (checksum_algorithm, computed_checksum) =
+                compute_checksum(&checksum_algorithms, &response.headers, &response.body);
+
+            let rb_headers = build_ruby_headers_hash(ruby, &response.headers);
+
+            // Call on_headers listeners
+            if let Some(ref listeners) = on_headers_listeners {
+                let status_val = ruby.into_value(response.status_code);
+                let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                let len = listeners.len();
+                for i in 0..len {
+                    let listener: Value = unsafe {
+                        Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                    };
+                    let _: Value = listener.funcall("call", (status_val, rb_headers_value))?;
+                }
+            }
 
             // Notify on_data listeners with the complete body
             if let Some(ref listeners) = on_data_listeners {
@@ -317,14 +416,16 @@ impl HttpClient {
                 }
             }
 
-            let rb_headers = build_ruby_headers(ruby, &response.headers);
             let rb_body = ruby.str_from_slice(&response.body);
-            let arr = RArray::from_slice(&[
-                ruby.into_value(response.status_code),
-                rb_headers.as_value(),
-                rb_body.as_value(),
-            ]);
-            Ok(arr.as_value())
+
+            let resp_obj = RubyHttpResponse::new_from_parts(
+                response.status_code,
+                rb_headers.as_raw(),
+                rb_body.as_value().as_raw(),
+                checksum_algorithm,
+                computed_checksum,
+            );
+            Ok(resp_obj.as_value())
         }
     }
 }
@@ -376,6 +477,149 @@ impl HttpClient {
         let ptr = cm.as_ptr();
         pools.insert(endpoint.to_string(), cm);
         Ok(ptr)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checksum computation
+// ---------------------------------------------------------------------------
+
+/// Compute a checksum over the response body based on the requested algorithms
+/// and the response headers.
+///
+/// Returns (algorithm_name, base64_checksum) if a matching header was found,
+/// or (None, None) if no match.
+fn compute_checksum(
+    algorithms: &Option<Vec<String>>,
+    response_headers: &[(String, String)],
+    body: &[u8],
+) -> (Option<String>, Option<String>) {
+    let algs = match algorithms {
+        Some(a) if !a.is_empty() => a,
+        _ => return (None, None),
+    };
+
+    // Find the first algorithm whose corresponding header exists in the response
+    for alg in algs {
+        let header_name = format!("x-amz-checksum-{}", alg.to_lowercase());
+        let has_header = response_headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case(&header_name)
+        });
+
+        if has_header {
+            // Compute the checksum
+            let checksum_b64 = compute_checksum_for_algorithm(alg, body);
+            return match checksum_b64 {
+                Some(cs) => (Some(alg.clone()), Some(cs)),
+                None => (None, None), // Unknown algorithm
+            };
+        }
+    }
+
+    (None, None)
+}
+
+/// Compute the checksum for a specific algorithm over the given data.
+/// Returns the base64-encoded result, or None if the algorithm is unknown.
+fn compute_checksum_for_algorithm(algorithm: &str, data: &[u8]) -> Option<String> {
+    let engine = base64::engine::general_purpose::STANDARD;
+
+    match algorithm.to_uppercase().as_str() {
+        "CRC32" => {
+            let crc = unsafe {
+                crate::crt::aws_checksums_crc32_ex(data.as_ptr(), data.len(), 0)
+            };
+            // Pack as 4 bytes big-endian, then base64
+            let bytes = crc.to_be_bytes();
+            Some(engine.encode(bytes))
+        }
+        "CRC32C" => {
+            let crc = unsafe {
+                crate::crt::aws_checksums_crc32c_ex(data.as_ptr(), data.len(), 0)
+            };
+            let bytes = crc.to_be_bytes();
+            Some(engine.encode(bytes))
+        }
+        "CRC64NVME" => {
+            let crc = unsafe {
+                crate::crt::aws_checksums_crc64nvme_ex(data.as_ptr(), data.len(), 0)
+            };
+            // Pack as 8 bytes big-endian, then base64
+            let bytes = crc.to_be_bytes();
+            Some(engine.encode(bytes))
+        }
+        "SHA256" => {
+            compute_sha_checksum(data, ShaAlgorithm::Sha256)
+        }
+        "SHA1" => {
+            compute_sha_checksum(data, ShaAlgorithm::Sha1)
+        }
+        _ => None,
+    }
+}
+
+enum ShaAlgorithm {
+    Sha1,
+    Sha256,
+}
+
+/// Compute SHA1 or SHA256 using the CRT one-shot functions.
+fn compute_sha_checksum(data: &[u8], algorithm: ShaAlgorithm) -> Option<String> {
+    let engine = base64::engine::general_purpose::STANDARD;
+
+    unsafe {
+        let allocator = crate::crt::aws_default_allocator();
+
+        // Determine output capacity
+        let capacity = match algorithm {
+            ShaAlgorithm::Sha1 => 20usize,
+            ShaAlgorithm::Sha256 => 32usize,
+        };
+
+        // Initialize output buffer
+        let mut output = crate::crt::AwsByteBuf {
+            len: 0,
+            buffer: std::ptr::null_mut(),
+            capacity: 0,
+            allocator: std::ptr::null_mut(),
+        };
+
+        let rc = crate::crt::aws_byte_buf_init(
+            &mut output,
+            allocator,
+            capacity,
+        );
+        if rc != 0 {
+            return None;
+        }
+
+        // Set up input cursor
+        let input = crate::crt::AwsByteCursor {
+            len: data.len(),
+            ptr: data.as_ptr(),
+        };
+
+        let result = match algorithm {
+            ShaAlgorithm::Sha1 => {
+                crate::crt::aws_sha1_compute(allocator, &input, &mut output, 0)
+            }
+            ShaAlgorithm::Sha256 => {
+                crate::crt::aws_sha256_compute(allocator, &input, &mut output, 0)
+            }
+        };
+
+        if result != 0 {
+            crate::crt::aws_byte_buf_clean_up(&mut output);
+            return None;
+        }
+
+        // Read the digest bytes
+        let digest = std::slice::from_raw_parts(output.buffer, output.len);
+        let encoded = engine.encode(digest);
+
+        crate::crt::aws_byte_buf_clean_up(&mut output);
+
+        Some(encoded)
     }
 }
 
@@ -520,17 +764,33 @@ fn parse_proxy_options(opts: &RHash) -> Result<Option<ProxyOptions>, Error> {
     }
 }
 
-/// Convert response headers to a Ruby Array of [name, value] pairs.
-fn build_ruby_headers(ruby: &Ruby, headers: &[(String, String)]) -> RArray {
-    let arr = RArray::with_capacity(headers.len());
+/// Convert response headers to a Ruby Hash with String keys and String values.
+/// Duplicate header names are merged into comma-separated values (per HTTP spec),
+/// matching the behavior expected by consumers like the SDK's flexible checksum plugin.
+fn build_ruby_headers_hash(ruby: &Ruby, headers: &[(String, String)]) -> RHash {
+    let hash = RHash::new();
     for (name, value) in headers {
-        let pair = RArray::from_slice(&[
-            ruby.str_new(name).as_value(),
-            ruby.str_new(value).as_value(),
-        ]);
-        let _ = arr.push(pair);
+        let rb_name = ruby.str_new(name);
+        let rb_value = ruby.str_new(value);
+        // Check if the key already exists; if so, merge with ", "
+        let existing: Option<Value> = hash.lookup(rb_name.as_value()).unwrap_or(None);
+        match existing {
+            Some(v) if !v.is_nil() => {
+                // Merge: "existing_value, new_value"
+                let existing_str = RString::from_value(v).unwrap();
+                let merged = format!(
+                    "{}, {}",
+                    unsafe { std::str::from_utf8_unchecked(existing_str.as_slice()) },
+                    value
+                );
+                let _ = hash.aset(rb_name.as_value(), ruby.str_new(&merged).as_value());
+            }
+            _ => {
+                let _ = hash.aset(rb_name.as_value(), rb_value.as_value());
+            }
+        }
     }
-    arr
+    hash
 }
 
 // ---------------------------------------------------------------------------

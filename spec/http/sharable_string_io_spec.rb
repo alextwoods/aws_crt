@@ -48,7 +48,8 @@ RSpec.describe AwsCrt::Http::SharableStringIO do
       client = AwsCrt::Http::Client.new
       endpoint = "http://127.0.0.1:#{port}"
       headers = [["Host", "127.0.0.1:#{port}"]]
-      _status, _headers, sio = client.request(endpoint, "GET", "/", headers, streaming_io: true)
+      response = client.request(endpoint, "GET", "/", headers, streaming_io: true)
+      sio = response.body
     end
     sio
   end
@@ -319,7 +320,7 @@ RSpec.describe AwsCrt::Http::SharableStringIO do
   describe "#write_to_file" do
     it "writes the entire buffer to a file" do
       sio = create_sio_with_content("Hello, file!")
-      path = File.join(Dir.tmpdir, "sio_write_test_#{$$}")
+      path = File.join(Dir.tmpdir, "sio_write_test_#{$}")
       begin
         bytes_written = sio.write_to_file(path)
         expect(bytes_written).to eq(12)
@@ -332,7 +333,7 @@ RSpec.describe AwsCrt::Http::SharableStringIO do
     it "writes at a byte offset" do
       content = "ABCDEFGH"
       sio = create_sio_with_content(content)
-      path = File.join(Dir.tmpdir, "sio_offset_test_#{$$}")
+      path = File.join(Dir.tmpdir, "sio_offset_test_#{$}")
       begin
         # Pre-fill the file with zeros
         File.binwrite(path, "\x00" * 16)
@@ -347,7 +348,7 @@ RSpec.describe AwsCrt::Http::SharableStringIO do
 
     it "returns 0 for an empty buffer" do
       sio = AwsCrt::Http::SharableStringIO.new
-      path = File.join(Dir.tmpdir, "sio_empty_test_#{$$}")
+      path = File.join(Dir.tmpdir, "sio_empty_test_#{$}")
       begin
         expect(sio.write_to_file(path)).to eq(0)
       ensure
@@ -364,7 +365,7 @@ RSpec.describe AwsCrt::Http::SharableStringIO do
   describe "#write_to_io" do
     it "writes the entire buffer to an IO object" do
       sio = create_sio_with_content("Hello, IO!")
-      path = File.join(Dir.tmpdir, "sio_io_test_#{$$}")
+      path = File.join(Dir.tmpdir, "sio_io_test_#{$}")
       begin
         File.open(path, "wb") do |f|
           bytes_written = sio.write_to_io(f)
@@ -378,7 +379,7 @@ RSpec.describe AwsCrt::Http::SharableStringIO do
 
     it "writes at a byte offset in the IO" do
       sio = create_sio_with_content("DATA")
-      path = File.join(Dir.tmpdir, "sio_io_offset_test_#{$$}")
+      path = File.join(Dir.tmpdir, "sio_io_offset_test_#{$}")
       begin
         File.binwrite(path, "\x00" * 16)
         File.open(path, "r+b") do |f|

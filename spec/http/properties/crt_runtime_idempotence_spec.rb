@@ -101,8 +101,8 @@ RSpec.describe "Property 1: CRT Resource Initialization Idempotence" do
           Thread.new do
             client = AwsCrt::Http::Client.new
             headers = [["Host", "127.0.0.1:#{port}"]]
-            status, _resp_headers, body = client.request(endpoint, "GET", "/test", headers)
-            responses[i] = { status: status, body: body }
+            response = client.request(endpoint, "GET", "/test", headers)
+            responses[i] = { status: response.status_code, body: response.body }
           rescue => e
             mutex.synchronize { errors << e }
           end

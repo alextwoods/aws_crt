@@ -2,10 +2,9 @@
 
 # Integration tests for the streaming_io feature of the CRT HTTP client.
 #
-# Tests that `streaming_io: true` returns a SharableStringIO with the
-# correct response body content, that combining streaming_io with a block
-# raises ArgumentError, and that existing (non-streaming_io) behavior
-# remains unchanged.
+# Tests that `streaming_io: true` returns an HttpResponse with a SharableStringIO
+# body, that combining streaming_io with a block raises ArgumentError, and that
+# existing (non-streaming_io) behavior remains unchanged.
 
 require "json"
 require "support/test_server"
@@ -24,24 +23,25 @@ RSpec.describe "streaming_io integration" do
     ["Host", "127.0.0.1:#{@server.port}"]
   end
 
-  describe "streaming_io: true returns a SharableStringIO" do
-    it "returns a SharableStringIO as the third element" do
-      status, headers, body_io = @client.request(
+  describe "streaming_io: true returns a SharableStringIO body" do
+    it "returns an HttpResponse with a SharableStringIO body" do
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header], streaming_io: true
       )
 
-      expect(status).to eq(200)
-      expect(headers).to be_an(Array)
-      expect(body_io).to be_a(AwsCrt::Http::SharableStringIO)
+      expect(response).to be_a(AwsCrt::Http::Response)
+      expect(response.status_code).to eq(200)
+      expect(response.headers).to be_a(Hash)
+      expect(response.body).to be_a(AwsCrt::Http::SharableStringIO)
     end
 
     it "contains the correct response body for a small response" do
-      status, _headers, body_io = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/small", [host_header], streaming_io: true
       )
 
-      expect(status).to eq(200)
-      body = body_io.read
+      expect(response.status_code).to eq(200)
+      body = response.body.read
       echo = JSON.parse(body)
       expect(echo["method"]).to eq("GET")
       expect(echo["path"]).to eq("/small")
@@ -49,32 +49,34 @@ RSpec.describe "streaming_io integration" do
 
     it "contains the correct response body for an empty-body response" do
       # HEAD requests return no body
-      status, _headers, body_io = @client.request(
+      response = @client.request(
         @server.endpoint, "HEAD", "/empty", [host_header], streaming_io: true
       )
 
-      expect(status).to eq(200)
-      expect(body_io.read).to eq("")
-      expect(body_io.size).to eq(0)
+      expect(response.status_code).to eq(200)
+      expect(response.body.read).to eq("")
+      expect(response.body.size).to eq(0)
     end
 
     it "contains the correct response body for a larger response (64KB)" do
       body_size = 64 * 1024
-      status, _headers, body_io = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/large?body_size=#{body_size}", [host_header],
         streaming_io: true
       )
 
-      expect(status).to eq(200)
-      content = body_io.read
+      expect(response.status_code).to eq(200)
+      content = response.body.read
       expect(content.bytesize).to eq(body_size)
       expect(content).to eq("x" * body_size)
     end
 
     it "returns a SharableStringIO that supports read, rewind, and size" do
-      _status, _headers, body_io = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header], streaming_io: true
       )
+
+      body_io = response.body
 
       # Read partial, then rewind and read all
       first_chunk = body_io.read(5)
@@ -87,20 +89,20 @@ RSpec.describe "streaming_io integration" do
     end
 
     it "returns a frozen, Ractor-shareable SharableStringIO" do
-      _status, _headers, body_io = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header], streaming_io: true
       )
 
-      expect(body_io).to be_frozen
-      expect(Ractor.shareable?(body_io)).to be true
+      expect(response.body).to be_frozen
+      expect(Ractor.shareable?(response.body)).to be true
     end
 
     it "returns ASCII-8BIT encoded content" do
-      _status, _headers, body_io = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header], streaming_io: true
       )
 
-      content = body_io.read
+      content = response.body.read
       expect(content.encoding).to eq(Encoding::ASCII_8BIT)
     end
   end
@@ -124,12 +126,12 @@ RSpec.describe "streaming_io integration" do
 
       # Run the HTTP request inside a Ractor, get back the SharableStringIO
       sio = Ractor.new(client, endpoint, port) do |c, ep, p|
-        _status, _headers, body_io = c.request(
+        response = c.request(
           ep, "GET", "/ractor-test",
           [["Host", "127.0.0.1:#{p}"]],
           streaming_io: true
         )
-        body_io
+        response.body
       end.value
 
       # Read the SharableStringIO here in the main Ractor
@@ -144,36 +146,37 @@ RSpec.describe "streaming_io integration" do
 
   describe "backward compatibility (no streaming_io)" do
     it "returns a body string when streaming_io is not specified" do
-      status, headers, body = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header]
       )
 
-      expect(status).to eq(200)
-      expect(headers).to be_an(Array)
-      expect(body).to be_a(String)
-      echo = JSON.parse(body)
+      expect(response).to be_a(AwsCrt::Http::Response)
+      expect(response.status_code).to eq(200)
+      expect(response.headers).to be_a(Hash)
+      expect(response.body).to be_a(String)
+      echo = JSON.parse(response.body)
       expect(echo["method"]).to eq("GET")
       expect(echo["path"]).to eq("/test")
     end
 
     it "returns a body string when streaming_io: false" do
-      status, _headers, body = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header], streaming_io: false
       )
 
-      expect(status).to eq(200)
-      expect(body).to be_a(String)
-      expect(body).not_to be_a(AwsCrt::Http::SharableStringIO)
+      expect(response.status_code).to eq(200)
+      expect(response.body).to be_a(String)
+      expect(response.body).not_to be_a(AwsCrt::Http::SharableStringIO)
     end
 
     it "yields chunks to a block when streaming without streaming_io" do
       chunks = []
-      status, headers = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header]
       ) { |chunk| chunks << chunk }
 
-      expect(status).to eq(200)
-      expect(headers).to be_an(Array)
+      expect(response.status_code).to eq(200)
+      expect(response.headers).to be_a(Hash)
       expect(chunks).not_to be_empty
       body = chunks.join
       echo = JSON.parse(body)
@@ -182,17 +185,17 @@ RSpec.describe "streaming_io integration" do
 
     it "streaming_io and buffered produce equivalent body content" do
       # Buffered (default)
-      _status_b, _headers_b, buffered_body = @client.request(
+      buffered_response = @client.request(
         @server.endpoint, "GET", "/equiv?body_size=4096", [host_header]
       )
 
       # streaming_io
-      _status_s, _headers_s, body_io = @client.request(
+      sio_response = @client.request(
         @server.endpoint, "GET", "/equiv?body_size=4096", [host_header],
         streaming_io: true
       )
 
-      expect(body_io.read).to eq(buffered_body)
+      expect(sio_response.body.read).to eq(buffered_response.body)
     end
   end
 
@@ -201,26 +204,26 @@ RSpec.describe "streaming_io integration" do
       received = []
       listener = ->(chunk) { received << chunk }
 
-      _status, _headers, body = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header],
         on_data: [listener]
       )
 
       expect(received.size).to eq(1)
-      expect(received.first).to eq(body)
+      expect(received.first).to eq(response.body)
     end
 
     it "calls on_data listeners with the body in streaming_io mode" do
       received = []
       listener = ->(chunk) { received << chunk }
 
-      _status, _headers, body_io = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header],
         streaming_io: true, on_data: [listener]
       )
 
       expect(received.size).to eq(1)
-      expect(received.first).to eq(body_io.read)
+      expect(received.first).to eq(response.body.read)
     end
 
     it "calls multiple on_data listeners" do
@@ -265,23 +268,123 @@ RSpec.describe "streaming_io integration" do
     end
 
     it "works with nil on_data (no-op)" do
-      status, _headers, body = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header],
         on_data: nil
       )
 
-      expect(status).to eq(200)
-      expect(body).to be_a(String)
+      expect(response.status_code).to eq(200)
+      expect(response.body).to be_a(String)
     end
 
     it "works with empty on_data array (no-op)" do
-      status, _headers, body = @client.request(
+      response = @client.request(
         @server.endpoint, "GET", "/test", [host_header],
         on_data: []
       )
 
+      expect(response.status_code).to eq(200)
+      expect(response.body).to be_a(String)
+    end
+  end
+
+  describe "on_headers listeners" do
+    it "calls on_headers listeners with (status_code, headers_hash) in buffered mode" do
+      received = []
+      listener = ->(status, headers) { received << [status, headers] }
+
+      response = @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_headers: [listener]
+      )
+
+      expect(received.size).to eq(1)
+      status, headers = received.first
       expect(status).to eq(200)
-      expect(body).to be_a(String)
+      expect(headers).to be_a(Hash)
+      expect(headers).to eq(response.headers)
+    end
+
+    it "calls on_headers listeners with (status_code, headers_hash) in streaming_io mode" do
+      received = []
+      listener = ->(status, headers) { received << [status, headers] }
+
+      response = @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        streaming_io: true, on_headers: [listener]
+      )
+
+      expect(received.size).to eq(1)
+      status, headers = received.first
+      expect(status).to eq(200)
+      expect(headers).to be_a(Hash)
+      expect(headers).to eq(response.headers)
+    end
+
+    it "calls on_headers listeners in block streaming mode" do
+      received = []
+      listener = ->(status, headers) { received << [status, headers] }
+
+      response = @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_headers: [listener]
+      ) { |_chunk| }
+
+      expect(received.size).to eq(1)
+      status, headers = received.first
+      expect(status).to eq(200)
+      expect(headers).to be_a(Hash)
+      expect(headers).to eq(response.headers)
+    end
+
+    it "calls on_headers before on_data" do
+      call_order = []
+      headers_listener = ->(_status, _headers) { call_order << :on_headers }
+      data_listener = ->(_chunk) { call_order << :on_data }
+
+      @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_headers: [headers_listener], on_data: [data_listener]
+      )
+
+      expect(call_order.first).to eq(:on_headers)
+      expect(call_order.last).to eq(:on_data)
+    end
+
+    it "calls multiple on_headers listeners" do
+      received_a = []
+      received_b = []
+      listener_a = ->(status, headers) { received_a << [status, headers] }
+      listener_b = ->(status, headers) { received_b << [status, headers] }
+
+      @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_headers: [listener_a, listener_b]
+      )
+
+      expect(received_a.size).to eq(1)
+      expect(received_b.size).to eq(1)
+      expect(received_a).to eq(received_b)
+    end
+
+    it "works with nil on_headers (no-op)" do
+      response = @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_headers: nil
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(response.body).to be_a(String)
+    end
+
+    it "works with empty on_headers array (no-op)" do
+      response = @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_headers: []
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(response.body).to be_a(String)
     end
   end
 end

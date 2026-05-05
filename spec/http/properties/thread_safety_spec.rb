@@ -111,8 +111,8 @@ RSpec.describe "Property 9: Multi-Threaded Request Safety" do
             ["Host", "127.0.0.1:#{@port}"],
             ["X-Request-Id", rid]
           ]
-          status, _, resp_body = client.request("http://127.0.0.1:#{@port}", "GET", "/thread/#{rid}", headers)
-          { request_id: rid, status: status, body: resp_body }
+          response = client.request("http://127.0.0.1:#{@port}", "GET", "/thread/#{rid}", headers)
+          { request_id: rid, status: response.status_code, body: response.body }
         end
       end
 
@@ -161,8 +161,8 @@ RSpec.describe "Property 9: Multi-Threaded Request Safety" do
             ["X-Request-Id", rid],
             ["Content-Length", req_body.bytesize.to_s]
           ]
-          status, _, resp_body = client.request("http://127.0.0.1:#{@port}", "POST", "/thread/#{rid}", headers, req_body)
-          { request_id: rid, status: status, body: resp_body, sent_body: req_body }
+          response = client.request("http://127.0.0.1:#{@port}", "POST", "/thread/#{rid}", headers, req_body)
+          { request_id: rid, status: response.status_code, body: response.body, sent_body: req_body }
         end
       end
 

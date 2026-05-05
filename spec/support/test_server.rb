@@ -203,6 +203,7 @@ module TestServerHandler
     head += "Content-Type: application/json\r\n"
     head += "Content-Length: #{body.bytesize}\r\n"
     head += duplicate_headers(request_headers)
+    head += checksum_headers(request_headers, body)
     head += "Connection: close\r\n\r\n"
     head
   end
@@ -217,6 +218,45 @@ module TestServerHandler
     return "" unless dup_name && dup_values_str
 
     dup_values_str.split(",").map { |val| "#{dup_name.strip}: #{val.strip}\r\n" }.join
+  end
+
+  # Checksum response headers: X-Add-Checksum value format is "algorithm"
+  # (e.g. "CRC32", "CRC32C", "SHA256"). Computes the checksum over the
+  # response body and adds the appropriate x-amz-checksum-* header.
+  def checksum_headers(request_headers, body)
+    algorithm = request_headers["X-Add-Checksum"]
+    return "" unless algorithm
+
+    algorithm = algorithm.strip.upcase
+    checksum_value = compute_test_checksum(algorithm, body)
+    return "" unless checksum_value
+
+    "x-amz-checksum-#{algorithm.downcase}: #{checksum_value}\r\n"
+  end
+
+  def compute_test_checksum(algorithm, body)
+    require "base64"
+    require "zlib"
+    require "digest"
+
+    case algorithm
+    when "CRC32"
+      crc = Zlib.crc32(body)
+      Base64.strict_encode64([crc].pack("N"))
+    when "CRC32C"
+      # Use CRT if available
+      crc = AwsCrt::Checksums.crc32c(body)
+      Base64.strict_encode64([crc].pack("N"))
+    when "CRC64NVME"
+      crc = AwsCrt::Checksums.crc64nvme(body)
+      Base64.strict_encode64([crc].pack("Q>"))
+    when "SHA1"
+      digest = Digest::SHA1.digest(body)
+      Base64.strict_encode64(digest)
+    when "SHA256"
+      digest = Digest::SHA256.digest(body)
+      Base64.strict_encode64(digest)
+    end
   end
 
   # Write body in chunks for large responses to exercise streaming.

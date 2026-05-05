@@ -71,12 +71,12 @@ RSpec.describe "Property 5: Multi-Endpoint Client Routing" do
         servers.each do |_server, _thread, port|
           endpoint = "http://127.0.0.1:#{port}"
           headers = [["Host", "127.0.0.1:#{port}"]]
-          status, _, resp_body = client.request(endpoint, "GET", "/affinity", headers)
+          response = client.request(endpoint, "GET", "/affinity", headers)
 
-          expect(status).to eq(200),
-            "Request to port #{port} returned status #{status}, expected 200"
+          expect(response.status_code).to eq(200),
+            "Request to port #{port} returned status #{response.status_code}, expected 200"
 
-          echo = JSON.parse(resp_body)
+          echo = JSON.parse(response.body)
           expect(echo["port"]).to eq(port),
             "Expected response from port #{port}, got port #{echo["port"]}"
           expect(echo["path"]).to eq("/affinity"),
@@ -87,10 +87,10 @@ RSpec.describe "Property 5: Multi-Endpoint Client Routing" do
         servers.each do |_server, _thread, port|
           endpoint = "http://127.0.0.1:#{port}"
           headers = [["Host", "127.0.0.1:#{port}"]]
-          status, _, resp_body = client.request(endpoint, "GET", "/again", headers)
+          response = client.request(endpoint, "GET", "/again", headers)
 
-          expect(status).to eq(200)
-          echo = JSON.parse(resp_body)
+          expect(response.status_code).to eq(200)
+          echo = JSON.parse(response.body)
           expect(echo["port"]).to eq(port),
             "Repeated request: expected port #{port}, got #{echo["port"]}"
         end

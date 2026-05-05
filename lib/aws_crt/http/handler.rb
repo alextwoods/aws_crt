@@ -49,19 +49,19 @@ module AwsCrt
       def buffer_response(client, endpoint, method, path, headers, body, resp) # rubocop:disable Metrics/ParameterLists
         args = [endpoint, method, path, headers]
         args << body unless body.nil?
-        status, resp_headers, resp_body = client.request(*args, streaming_io: true)
-        resp.signal_headers(status, headers_to_hash(resp_headers))
-        resp.signal_data(resp_body.read) unless resp_body.size.zero?
+        response = client.request(*args, streaming_io: true)
+        resp.signal_headers(response.status_code, response.headers)
+        resp.signal_data(response.body.read) unless response.body.size.zero?
         resp.signal_done
       end
 
       def stream_response(client, endpoint, method, path, headers, body, resp) # rubocop:disable Metrics/ParameterLists
         args = [endpoint, method, path, headers]
         args << body unless body.nil?
-        status, resp_headers = client.request(*args) do |chunk|
+        response = client.request(*args) do |chunk|
           resp.signal_data(chunk)
         end
-        resp.signal_headers(status, headers_to_hash(resp_headers))
+        resp.signal_headers(response.status_code, response.headers)
         resp.signal_done
       end
 
@@ -77,12 +77,6 @@ module AwsCrt
         data = body.respond_to?(:read) ? body.read : body.to_s
         body.rewind if body.respond_to?(:rewind)
         data.empty? ? nil : data
-      end
-
-      def headers_to_hash(headers)
-        hash = {}
-        headers.each { |name, value| hash[name] = value }
-        hash
       end
 
       def streaming?(context)

@@ -114,14 +114,16 @@ RSpec.describe "Property 3: Duplicate Header Merging" do
       DuplicateHeaderServer.next_response_headers = raw_headers
 
       client = make_client
-      _status, resp_headers, _body = client.request("http://127.0.0.1:#{@port}", 
+      response = client.request("http://127.0.0.1:#{@port}",
         "GET", "/", [["Host", "127.0.0.1:#{@port}"]]
       )
 
       # Build a hash from response headers, accumulating values for
       # duplicate names (in case the CRT returns them as separate entries).
+      # With Hash response, the headers are already a Hash. The CRT merges
+      # duplicate non-Set-Cookie headers into comma-separated values.
       resp_hash = {}
-      resp_headers.each do |name, value|
+      response.headers.each do |name, value|
         resp_hash[name] = resp_hash.key?(name) ? "#{resp_hash[name]}, #{value}" : value
       end
 
@@ -150,19 +152,21 @@ RSpec.describe "Property 3: Duplicate Header Merging" do
       DuplicateHeaderServer.next_response_headers = raw_headers
 
       client = make_client
-      _status, resp_headers, _body = client.request("http://127.0.0.1:#{@port}", 
+      response = client.request("http://127.0.0.1:#{@port}",
         "GET", "/", [["Host", "127.0.0.1:#{@port}"]]
       )
 
-      # Collect all Set-Cookie entries from the response
-      set_cookie_values = resp_headers
-                          .select { |name, _| name.casecmp("set-cookie").zero? }
-                          .map { |_, value| value }
-
-      expect(set_cookie_values).to eq(cookie_values),
-                                    "Set-Cookie headers should be kept as separate entries.\n" \
-                                    "Expected: #{cookie_values.inspect}\n" \
-                                    "Got: #{set_cookie_values.inspect}"
+      # With a Hash, duplicate Set-Cookie headers are merged into a
+      # comma-separated string (same as other headers). Splitting by
+      # ", " should recover the original values.
+      merged = response.headers["Set-Cookie"]
+      expect(merged).not_to be_nil,
+                            "Expected Set-Cookie header in response"
+      recovered = merged.split(", ")
+      expect(recovered).to eq(cookie_values),
+                            "Set-Cookie headers should contain all values.\n" \
+                            "Expected: #{cookie_values.inspect}\n" \
+                            "Got: #{recovered.inspect}"
     end
   end
 end

@@ -29,15 +29,15 @@ RSpec.describe "Basic HTTP request integration" do
   end
 
   def headers_hash(headers)
-    headers.to_h.transform_keys(&:downcase)
+    headers.transform_keys(&:downcase)
   end
 
   describe "HTTP methods" do
     it "sends a GET request and receives the echo response" do
-      status, _headers, body = @client.request(@server.endpoint, "GET", "/test", [host_header])
+      response = @client.request(@server.endpoint, "GET", "/test", [host_header])
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("GET")
       expect(echo["path"]).to eq("/test")
       expect(echo["body"]).to eq("")
@@ -50,10 +50,10 @@ RSpec.describe "Basic HTTP request integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @client.request(@server.endpoint, "POST", "/submit", request_headers, request_body)
+      response = @client.request(@server.endpoint, "POST", "/submit", request_headers, request_body)
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("POST")
       expect(echo["path"]).to eq("/submit")
       expect(echo["body"]).to eq("hello world")
@@ -67,20 +67,20 @@ RSpec.describe "Basic HTTP request integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @client.request(@server.endpoint, "PUT", "/resource/1", request_headers, request_body)
+      response = @client.request(@server.endpoint, "PUT", "/resource/1", request_headers, request_body)
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("PUT")
       expect(echo["path"]).to eq("/resource/1")
       expect(echo["body"]).to eq('{"key":"value"}')
     end
 
     it "sends a DELETE request without a body" do
-      status, _headers, body = @client.request(@server.endpoint, "DELETE", "/resource/1", [host_header])
+      response = @client.request(@server.endpoint, "DELETE", "/resource/1", [host_header])
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("DELETE")
       expect(echo["path"]).to eq("/resource/1")
       expect(echo["body"]).to eq("")
@@ -93,10 +93,10 @@ RSpec.describe "Basic HTTP request integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @client.request(@server.endpoint, "DELETE", "/resource/1", request_headers, request_body)
+      response = @client.request(@server.endpoint, "DELETE", "/resource/1", request_headers, request_body)
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("DELETE")
       expect(echo["body"]).to eq('{"id":42}')
     end
@@ -109,22 +109,22 @@ RSpec.describe "Basic HTTP request integration" do
         ["Content-Length", request_body.bytesize.to_s]
       ]
 
-      status, _headers, body = @client.request(@server.endpoint, "PATCH", "/resource/1", request_headers, request_body)
+      response = @client.request(@server.endpoint, "PATCH", "/resource/1", request_headers, request_body)
 
-      expect(status).to eq(200)
-      echo = parse_echo(body)
+      expect(response.status_code).to eq(200)
+      echo = parse_echo(response.body)
       expect(echo["method"]).to eq("PATCH")
       expect(echo["path"]).to eq("/resource/1")
       expect(echo["body"]).to eq('{"name":"updated"}')
     end
 
     it "sends a HEAD request and receives no body" do
-      status, headers, body = @client.request(@server.endpoint, "HEAD", "/info", [host_header])
+      response = @client.request(@server.endpoint, "HEAD", "/info", [host_header])
 
-      expect(status).to eq(200)
-      expect(body).to eq("")
+      expect(response.status_code).to eq(200)
+      expect(response.body).to eq("")
       # HEAD responses still include headers
-      header_hash = headers_hash(headers)
+      header_hash = headers_hash(response.headers)
       expect(header_hash).to have_key("content-type")
     end
   end
@@ -132,12 +132,12 @@ RSpec.describe "Basic HTTP request integration" do
   describe "requests without bodies" do
     %w[GET DELETE HEAD].each do |method|
       it "#{method} without a body succeeds" do
-        status, _headers, body = @client.request(@server.endpoint, method, "/no-body", [host_header])
+        response = @client.request(@server.endpoint, method, "/no-body", [host_header])
 
-        expect(status).to eq(200)
+        expect(response.status_code).to eq(200)
         next if method == "HEAD" # HEAD has no response body to parse
 
-        echo = parse_echo(body)
+        echo = parse_echo(response.body)
         expect(echo["method"]).to eq(method)
         expect(echo["body"]).to eq("")
       end
@@ -153,10 +153,10 @@ RSpec.describe "Basic HTTP request integration" do
           ["Content-Length", request_body.bytesize.to_s]
         ]
 
-        status, _headers, body = @client.request(@server.endpoint, method, "/with-body", request_headers, request_body)
+        response = @client.request(@server.endpoint, method, "/with-body", request_headers, request_body)
 
-        expect(status).to eq(200)
-        echo = parse_echo(body)
+        expect(response.status_code).to eq(200)
+        echo = parse_echo(response.body)
         expect(echo["method"]).to eq(method)
         expect(echo["body"]).to eq(request_body)
       end
@@ -165,47 +165,50 @@ RSpec.describe "Basic HTTP request integration" do
 
   describe "response status code" do
     it "returns 200 for a successful request" do
-      status, _headers, _body = @client.request(@server.endpoint, "GET", "/", [host_header])
-      expect(status).to eq(200)
+      response = @client.request(@server.endpoint, "GET", "/", [host_header])
+      expect(response.status_code).to eq(200)
     end
   end
 
   describe "response headers" do
-    it "returns response headers as name-value pairs" do
-      _status, headers, _body = @client.request(@server.endpoint, "GET", "/", [host_header])
+    it "returns response headers as a Hash" do
+      response = @client.request(@server.endpoint, "GET", "/", [host_header])
 
-      expect(headers).to be_an(Array)
-      expect(headers).to all(be_an(Array).and(have_attributes(size: 2)))
+      expect(response.headers).to be_a(Hash)
+      response.headers.each do |name, value|
+        expect(name).to be_a(String)
+        expect(value).to be_a(String)
+      end
     end
 
     it "includes Content-Type in the response" do
-      _status, headers, _body = @client.request(@server.endpoint, "GET", "/", [host_header])
+      response = @client.request(@server.endpoint, "GET", "/", [host_header])
 
-      header_hash = headers_hash(headers)
+      header_hash = headers_hash(response.headers)
       expect(header_hash["content-type"]).to eq("application/json")
     end
 
     it "includes Content-Length in the response" do
-      _status, headers, body = @client.request(@server.endpoint, "GET", "/", [host_header])
+      response = @client.request(@server.endpoint, "GET", "/", [host_header])
 
-      header_hash = headers_hash(headers)
-      expect(header_hash["content-length"]).to eq(body.bytesize.to_s)
+      header_hash = headers_hash(response.headers)
+      expect(header_hash["content-length"]).to eq(response.body.bytesize.to_s)
     end
   end
 
   describe "response body" do
     it "returns the complete response body as a string" do
-      _status, _headers, body = @client.request(@server.endpoint, "GET", "/", [host_header])
+      response = @client.request(@server.endpoint, "GET", "/", [host_header])
 
-      expect(body).to be_a(String)
-      echo = parse_echo(body)
+      expect(response.body).to be_a(String)
+      echo = parse_echo(response.body)
       expect(echo).to be_a(Hash)
       expect(echo).to have_key("method")
     end
 
     it "returns an empty body for HEAD requests" do
-      _status, _headers, body = @client.request(@server.endpoint, "HEAD", "/", [host_header])
-      expect(body).to eq("")
+      response = @client.request(@server.endpoint, "HEAD", "/", [host_header])
+      expect(response.body).to eq("")
     end
   end
 
@@ -217,9 +220,9 @@ RSpec.describe "Basic HTTP request integration" do
         %w[X-Another another-value]
       ]
 
-      _status, _headers, body = @client.request(@server.endpoint, "GET", "/headers", request_headers)
+      response = @client.request(@server.endpoint, "GET", "/headers", request_headers)
 
-      echo = parse_echo(body)
+      echo = parse_echo(response.body)
       expect(echo["headers"]["X-Custom-Header"]).to eq("custom-value")
       expect(echo["headers"]["X-Another"]).to eq("another-value")
     end
@@ -227,22 +230,35 @@ RSpec.describe "Basic HTTP request integration" do
 
   describe "request paths" do
     it "handles a root path" do
-      _status, _headers, body = @client.request(@server.endpoint, "GET", "/", [host_header])
-      echo = parse_echo(body)
+      response = @client.request(@server.endpoint, "GET", "/", [host_header])
+      echo = parse_echo(response.body)
       expect(echo["path"]).to eq("/")
     end
 
     it "handles nested paths" do
-      _status, _headers, body = @client.request(@server.endpoint, "GET", "/a/b/c/d", [host_header])
-      echo = parse_echo(body)
+      response = @client.request(@server.endpoint, "GET", "/a/b/c/d", [host_header])
+      echo = parse_echo(response.body)
       expect(echo["path"]).to eq("/a/b/c/d")
     end
 
     it "handles paths with query strings" do
-      _status, _headers, body = @client.request(@server.endpoint, "GET", "/search?q=test&page=1", [host_header])
-      echo = parse_echo(body)
+      response = @client.request(@server.endpoint, "GET", "/search?q=test&page=1", [host_header])
+      echo = parse_echo(response.body)
       expect(echo["path"]).to eq("/search")
       expect(echo["query"]).to include("q" => "test", "page" => "1")
+    end
+  end
+
+  describe "returns HttpResponse object" do
+    it "returns an AwsCrt::Http::Response instance" do
+      response = @client.request(@server.endpoint, "GET", "/test", [host_header])
+      expect(response).to be_a(AwsCrt::Http::Response)
+    end
+
+    it "has nil checksum fields by default" do
+      response = @client.request(@server.endpoint, "GET", "/test", [host_header])
+      expect(response.checksum_algorithm).to be_nil
+      expect(response.computed_checksum).to be_nil
     end
   end
 end

@@ -25,10 +25,10 @@ RSpec.describe TestServer do
       body = "test body"
       request_headers = headers + [["Content-Length", body.bytesize.to_s]]
 
-      status, _, resp_body = client.request(@server.endpoint, "POST", "/echo", request_headers, body)
+      response = client.request(@server.endpoint, "POST", "/echo", request_headers, body)
 
-      expect(status).to eq(200)
-      echo = JSON.parse(resp_body)
+      expect(response.status_code).to eq(200)
+      echo = JSON.parse(response.body)
       expect(echo["method"]).to eq("POST")
       expect(echo["path"]).to eq("/echo")
       expect(echo["headers"]["X-Custom"]).to eq("hello")
@@ -40,10 +40,10 @@ RSpec.describe TestServer do
       headers = host_header + [["X-Delay", "0.1"]]
 
       start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      status, = client.request(@server.endpoint, "GET", "/slow", headers)
+      response = client.request(@server.endpoint, "GET", "/slow", headers)
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
 
-      expect(status).to eq(200)
+      expect(response.status_code).to eq(200)
       expect(elapsed).to be >= 0.1
     end
 
@@ -51,10 +51,10 @@ RSpec.describe TestServer do
       client = make_client
 
       start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      status, = client.request(@server.endpoint, "GET", "/slow?delay=0.1", host_header)
+      response = client.request(@server.endpoint, "GET", "/slow?delay=0.1", host_header)
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
 
-      expect(status).to eq(200)
+      expect(response.status_code).to eq(200)
       expect(elapsed).to be >= 0.1
     end
 
@@ -62,50 +62,51 @@ RSpec.describe TestServer do
       client = make_client
       headers = host_header + [["X-Dup-Header", "X-Multi:val1,val2,val3"]]
 
-      status, resp_headers = client.request(@server.endpoint, "GET", "/dup", headers)
+      response = client.request(@server.endpoint, "GET", "/dup", headers)
 
-      expect(status).to eq(200)
-      # resp_headers is an array of [name, value] pairs. The CRT may
-      # merge duplicates into comma-separated values or keep separate.
+      expect(response.status_code).to eq(200)
+      # resp_headers is a Hash. The CRT may merge duplicates into
+      # comma-separated values or keep separate (last value wins in Hash).
       # Collect all values for X-Multi, then split any comma-separated ones.
-      multi_entries = resp_headers.each_with_object([]) do |(name, value), acc|
-        acc << value if name == "X-Multi"
+      multi_values = []
+      response.headers.each do |name, value|
+        multi_values << value if name == "X-Multi"
       end
       # CRT may merge into comma-separated or keep separate — either way
       # all three values should be present
-      expect(multi_entries.flat_map { |v| v.split(", ") })
+      expect(multi_values.flat_map { |v| v.split(", ") })
         .to include("val1", "val2", "val3")
     end
 
     it "supports large response bodies via body_size query parameter" do
       client = make_client
 
-      status, _, resp_body = client.request(@server.endpoint, 
+      response = client.request(@server.endpoint,
         "GET", "/large?body_size=65536", host_header
       )
 
-      expect(status).to eq(200)
-      expect(resp_body.bytesize).to eq(65_536)
+      expect(response.status_code).to eq(200)
+      expect(response.body.bytesize).to eq(65_536)
     end
 
     it "returns no body for HEAD requests" do
       client = make_client
 
-      status, _, resp_body = client.request(@server.endpoint, "HEAD", "/head", host_header)
+      response = client.request(@server.endpoint, "HEAD", "/head", host_header)
 
-      expect(status).to eq(200)
-      expect(resp_body).to eq("")
+      expect(response.status_code).to eq(200)
+      expect(response.body).to eq("")
     end
 
     it "parses query parameters into the echo response" do
       client = make_client
 
-      status, _, resp_body = client.request(@server.endpoint, 
+      response = client.request(@server.endpoint,
         "GET", "/search?q=hello&page=2", host_header
       )
 
-      expect(status).to eq(200)
-      echo = JSON.parse(resp_body)
+      expect(response.status_code).to eq(200)
+      echo = JSON.parse(response.body)
       expect(echo["query"]).to eq("q" => "hello", "page" => "2")
     end
   end
@@ -128,13 +129,13 @@ RSpec.describe TestServer do
         ssl_verify_peer: false
       )
 
-      status, _, resp_body = client.request(@server.endpoint, 
+      response = client.request(@server.endpoint,
         "GET", "/tls-test",
         [["Host", "127.0.0.1:#{@server.port}"]]
       )
 
-      expect(status).to eq(200)
-      echo = JSON.parse(resp_body)
+      expect(response.status_code).to eq(200)
+      echo = JSON.parse(response.body)
       expect(echo["method"]).to eq("GET")
       expect(echo["path"]).to eq("/tls-test")
     end

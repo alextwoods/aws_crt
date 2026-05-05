@@ -66,18 +66,19 @@ RSpec.describe AwsCrt::Http::Client do
   end
 
   describe "#request" do
-    it "sends a GET request and returns status, headers, and body" do
+    it "sends a GET request and returns an HttpResponse" do
       with_echo_server do |port|
         client = described_class.new
         endpoint = "http://127.0.0.1:#{port}"
         headers = [["Host", "127.0.0.1:#{port}"], ["Accept", "*/*"]]
 
-        status, resp_headers, body = client.request(endpoint, "GET", "/hello", headers)
+        response = client.request(endpoint, "GET", "/hello", headers)
 
-        expect(status).to eq(200)
-        expect(body).to include("GET /hello")
+        expect(response).to be_a(AwsCrt::Http::Response)
+        expect(response.status_code).to eq(200)
+        expect(response.body).to include("GET /hello")
 
-        header_hash = resp_headers.to_h { |name, value| [name.downcase, value] }
+        header_hash = response.headers.to_h { |name, value| [name.downcase, value] }
         expect(header_hash["x-custom"]).to eq("test-value")
       end
     end
@@ -91,13 +92,13 @@ RSpec.describe AwsCrt::Http::Client do
           ["Content-Length", "11"]
         ]
 
-        status, _resp_headers, body = client.request(
+        response = client.request(
           endpoint, "POST", "/submit", headers, "hello world"
         )
 
-        expect(status).to eq(200)
-        expect(body).to include("POST /submit")
-        expect(body).to include("hello world")
+        expect(response.status_code).to eq(200)
+        expect(response.body).to include("POST /submit")
+        expect(response.body).to include("hello world")
       end
     end
 
@@ -108,13 +109,14 @@ RSpec.describe AwsCrt::Http::Client do
         headers = [["Host", "127.0.0.1:#{port}"]]
 
         chunks = []
-        status, resp_headers = client.request(endpoint, "GET", "/stream", headers) do |chunk|
+        response = client.request(endpoint, "GET", "/stream", headers) do |chunk|
           chunks << chunk
         end
 
-        expect(status).to eq(200)
+        expect(response.status_code).to eq(200)
         expect(chunks.join).to include("GET /stream")
-        expect(resp_headers).to be_an(Array)
+        expect(response.headers).to be_a(Hash)
+        expect(response.body).to be_nil
       end
     end
 
@@ -141,11 +143,11 @@ RSpec.describe AwsCrt::Http::Client do
         headers = [["Host", "127.0.0.1:#{port}"]]
 
         # Make two requests to the same endpoint — should reuse the pool
-        status1, _, _ = client.request(endpoint, "GET", "/first", headers)
-        status2, _, _ = client.request(endpoint, "GET", "/second", headers)
+        r1 = client.request(endpoint, "GET", "/first", headers)
+        r2 = client.request(endpoint, "GET", "/second", headers)
 
-        expect(status1).to eq(200)
-        expect(status2).to eq(200)
+        expect(r1.status_code).to eq(200)
+        expect(r2.status_code).to eq(200)
       end
     end
   end
@@ -159,9 +161,9 @@ RSpec.describe AwsCrt::Http::Client do
         endpoint = "http://127.0.0.1:#{port}"
         headers = [["Host", "127.0.0.1:#{port}"]]
 
-        status, _, body = client.request(endpoint, "GET", "/frozen", headers)
-        expect(status).to eq(200)
-        expect(body).to include("GET /frozen")
+        response = client.request(endpoint, "GET", "/frozen", headers)
+        expect(response.status_code).to eq(200)
+        expect(response.body).to include("GET /frozen")
       end
     end
   end
@@ -175,11 +177,11 @@ RSpec.describe AwsCrt::Http::Client do
 
         threads = 8.times.map do |i|
           Thread.new do
-            status, _, body = client.request(
+            response = client.request(
               endpoint, "GET", "/thread-#{i}",
               [["Host", "127.0.0.1:#{port}"]]
             )
-            results[i] = [status, body]
+            results[i] = [response.status_code, response.body]
           end
         end
         threads.each(&:join)

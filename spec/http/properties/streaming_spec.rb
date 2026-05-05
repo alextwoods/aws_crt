@@ -98,23 +98,23 @@ RSpec.describe "Property 4: Streaming Body Integrity" do
       client = make_client
 
       # Buffered request
-      _status_b, _headers_b, buffered_body = client.request("http://127.0.0.1:#{@port}", 
+      buffered_response = client.request("http://127.0.0.1:#{@port}",
         "GET", "/buffered", request_headers
       )
 
       # Streaming request — collect all yielded chunks
       StreamingBodyServer.next_response_body = body
       chunks = []
-      _status_s, _headers_s = client.request("http://127.0.0.1:#{@port}", 
+      client.request("http://127.0.0.1:#{@port}",
         "GET", "/streaming", request_headers
       ) { |chunk| chunks << chunk.b }
 
       streamed_body = chunks.join.b
 
-      expect(streamed_body).to eq(buffered_body.b),
+      expect(streamed_body).to eq(buffered_response.body.b),
                                "Streaming body (#{streamed_body.bytesize} bytes from " \
                                "#{chunks.size} chunks) differs from buffered body " \
-                               "(#{buffered_body.bytesize} bytes) for a #{body.bytesize}-byte response"
+                               "(#{buffered_response.body.bytesize} bytes) for a #{body.bytesize}-byte response"
     end
   end
 end

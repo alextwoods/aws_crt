@@ -189,43 +189,101 @@ client = AwsCrt::Http::Client.new(
 )
 
 # Buffered response
-status, headers, body = client.request(
+response = client.request(
   "https://example.com", "GET", "/path",
   [["Host", "example.com"]]
 )
+response.status_code  # => 200
+response.headers      # => {"content-type" => "application/json", "content-length" => "42"}
+response.body         # => "..." (String)
 
-# Streaming response
-status, headers = client.request(
+# Streaming response (block)
+response = client.request(
   "https://example.com", "GET", "/large",
   [["Host", "example.com"]]
 ) do |chunk|
   # process each chunk as it arrives
 end
+response.status_code  # => 200
+response.body         # => nil (data was streamed to block)
 
-# streaming_io response — returns a Ractor-safe SharableStringIO
-status, headers, body_io = client.request(
+# streaming_io response — body is a Ractor-safe SharableStringIO
+response = client.request(
   "https://example.com", "GET", "/data",
   [["Host", "example.com"]],
   streaming_io: true
 )
-
-body_io.read       # => all response bytes (ASCII-8BIT)
-body_io.size       # => total byte count
-body_io.rewind     # => reset read position to 0
-body_io.read(1024) # => read up to 1024 bytes
-body_io.eof?       # => true when fully consumed
-body_io.frozen?    # => true (always frozen)
-Ractor.shareable?(body_io) # => true
+response.body          # => AwsCrt::Http::SharableStringIO
+response.body.read     # => all response bytes (ASCII-8BIT)
+response.body.size     # => total byte count
+response.body.rewind   # => reset read position to 0
+response.body.frozen?  # => true (always frozen)
+Ractor.shareable?(response.body) # => true
 ```
 
+All request modes return an `AwsCrt::Http::Response` with:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `status_code` | Integer | HTTP status code |
+| `headers` | Hash | Response headers (`{"name" => "value"}`, duplicates comma-merged) |
+| `body` | String, SharableStringIO, or nil | Response body (nil in block streaming mode) |
+| `checksum_algorithm` | String or nil | Matched algorithm name (e.g. `"CRC32"`) |
+| `computed_checksum` | String or nil | Base64-encoded computed checksum |
+
 The `streaming_io: true` option returns an `AwsCrt::Http::SharableStringIO`
-instead of a plain String. This is a read-only, frozen, Ractor-shareable IO
-object backed by a native Rust buffer. Response bytes accumulate in Rust
-without crossing the Ruby boundary during the HTTP response, minimizing GVL
-contention. Bytes only cross into Ruby when you call `read`.
+as the body instead of a plain String. This is a read-only, frozen,
+Ractor-shareable IO object backed by a native Rust buffer. Response bytes
+accumulate in Rust without crossing the Ruby boundary during the HTTP
+response, minimizing GVL contention. Bytes only cross into Ruby when you
+call `read`.
 
 `streaming_io: true` and a block are mutually exclusive — passing both raises
 `ArgumentError`.
+
+#### Native checksum computation
+
+Pass `checksum_algorithms:` to compute a response body checksum entirely in
+native code (CRT hardware-accelerated CRC, or CRT SHA via aws-c-cal):
+
+```ruby
+response = client.request(
+  "https://s3.amazonaws.com", "GET", "/bucket/key",
+  [["Host", "s3.amazonaws.com"]],
+  checksum_algorithms: ["CRC32", "CRC32C", "CRC64NVME", "SHA1", "SHA256"]
+)
+
+response.checksum_algorithm  # => "CRC32" (first algorithm whose header was present)
+response.computed_checksum   # => "aB3x+Q==" (base64-encoded checksum of the body)
+```
+
+The client checks response headers in priority order for
+`x-amz-checksum-{algorithm}`. The first match determines which algorithm to
+use. The checksum is computed over the full response body in Rust — no Ruby
+boundary crossing, no String allocation for the computation.
+
+Supported algorithms: `CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, `SHA256`.
+
+The client does not verify the checksum — it just computes and returns it.
+Verification is left to the caller.
+
+#### on_headers listeners
+
+Pass an array of callables via `on_headers:` to observe response headers.
+Each listener is called once with `(status_code, headers_hash)`:
+
+```ruby
+response = client.request(
+  "https://example.com", "GET", "/data",
+  [["Host", "example.com"]],
+  on_headers: [->(status, headers) {
+    puts "#{status}: #{headers['content-type']}"
+  }]
+)
+```
+
+`on_headers` listeners are always called before `on_data` listeners.
+`on_headers: nil` or `on_headers: []` is a no-op.
 
 #### on_data listeners
 
@@ -235,14 +293,14 @@ Pass an array of callables via `on_data:` to observe response body data:
 logger = ->(chunk) { puts "received #{chunk.bytesize} bytes" }
 
 # Buffered/streaming_io — listeners called once with the complete body
-status, headers, body = client.request(
+response = client.request(
   "https://example.com", "GET", "/data",
   [["Host", "example.com"]],
   on_data: [logger]
 )
 
 # Block streaming — listeners called per-chunk alongside the block
-client.request(
+response = client.request(
   "https://example.com", "GET", "/data",
   [["Host", "example.com"]],
   on_data: [logger]
@@ -260,19 +318,19 @@ so other threads and fibers can run concurrently.
 
 ```ruby
 # Write entire response body to a file (bytes go Rust → kernel, never touch Ruby)
-body_io.write_to_file("/tmp/response.bin")
+response.body.write_to_file("/tmp/response.bin")
 
 # Write at a byte offset (useful for parallel range downloads)
-body_io.write_to_file(path, offset: range_start)
+response.body.write_to_file(path, offset: range_start)
 
 # Write to an open IO object (uses the fd directly when available)
 File.open(path, "r+b") do |f|
-  body_io.write_to_io(f, offset: byte_offset)
+  response.body.write_to_io(f, offset: byte_offset)
 end
 
 # Falls back to io.write for non-fd IOs like StringIO
 buf = StringIO.new
-body_io.write_to_io(buf)
+response.body.write_to_io(buf)
 ```
 
 Both methods return the number of bytes written.
@@ -668,23 +726,23 @@ Ractor.shareable?(signed_client)  # => true
 # Use from multiple Ractors
 ractors = 4.times.map do |i|
   Ractor.new(client, i) do |c, idx|
-    status, _, body = c.request(
+    response = c.request(
       "http://example.com", "GET", "/ractor-#{idx}",
       [["Host", "example.com"]]
     )
-    [idx, status]
+    [idx, response.status_code]
   end
 end
 results = ractors.map(&:take)
 
 # streaming_io with Ractors — SharableStringIO crosses the boundary safely
 ractor = Ractor.new(client) do |c|
-  _status, _headers, body_io = c.request(
+  response = c.request(
     "http://example.com", "GET", "/data",
     [["Host", "example.com"]],
     streaming_io: true
   )
-  body_io  # SharableStringIO is frozen and Ractor-shareable
+  response.body  # SharableStringIO is frozen and Ractor-shareable
 end
 
 body_io = ractor.value
