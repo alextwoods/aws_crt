@@ -227,6 +227,31 @@ contention. Bytes only cross into Ruby when you call `read`.
 `streaming_io: true` and a block are mutually exclusive — passing both raises
 `ArgumentError`.
 
+#### on_data listeners
+
+Pass an array of callables via `on_data:` to observe response body data:
+
+```ruby
+logger = ->(chunk) { puts "received #{chunk.bytesize} bytes" }
+
+# Buffered/streaming_io — listeners called once with the complete body
+status, headers, body = client.request(
+  "https://example.com", "GET", "/data",
+  [["Host", "example.com"]],
+  on_data: [logger]
+)
+
+# Block streaming — listeners called per-chunk alongside the block
+client.request(
+  "https://example.com", "GET", "/data",
+  [["Host", "example.com"]],
+  on_data: [logger]
+) { |chunk| process(chunk) }
+```
+
+`on_data: nil` or `on_data: []` is a no-op. Listeners are not called for
+empty response bodies.
+
 #### Zero-copy file writes
 
 `SharableStringIO` can write its buffer directly to a file or IO without

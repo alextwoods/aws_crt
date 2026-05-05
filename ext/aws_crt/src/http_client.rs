@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use magnus::prelude::*;
-use magnus::rb_sys::AsRawValue;
+use magnus::rb_sys::{AsRawValue, FromRawValue};
 use magnus::scan_args::{get_kwargs, scan_args};
 use magnus::typed_data::{self, DataType, DataTypeFunctions, TypedData};
 use magnus::value::Lazy;
@@ -144,9 +144,23 @@ impl HttpClient {
         let body = args.optional.0;
 
         // Extract keyword arguments
-        let kwargs = get_kwargs::<_, (), (Option<bool>,), ()>(args.keywords, &[], &["streaming_io"])?;
-        let (streaming_io_opt,) = kwargs.optional;
+        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<Value>), ()>(args.keywords, &[], &["streaming_io", "on_data"])?;
+        let (streaming_io_opt, on_data_opt) = kwargs.optional;
         let streaming_io = streaming_io_opt.unwrap_or(false);
+
+        // Extract on_data listeners (Array of Procs or nil)
+        let on_data_listeners: Option<RArray> = match on_data_opt {
+            Some(v) if !v.is_nil() => {
+                let arr = RArray::from_value(v).ok_or_else(|| {
+                    Error::new(
+                        magnus::exception::type_error(),
+                        "on_data must be an Array of callable objects",
+                    )
+                })?;
+                if arr.len() > 0 { Some(arr) } else { None }
+            }
+            _ => None,
+        };
 
         // Check if a block was given
         let block = ruby.block_given();
@@ -213,6 +227,20 @@ impl HttpClient {
             )
             .map_err(|e| -> Error { e.into() })?;
 
+            // Notify on_data listeners with the complete body
+            if let Some(ref listeners) = on_data_listeners {
+                if !response.body.is_empty() {
+                    let rb_chunk = ruby.str_from_slice(&response.body);
+                    let len = listeners.len();
+                    for i in 0..len {
+                        let listener: Value = unsafe {
+                            Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                        };
+                        let _: Value = listener.funcall("call", (rb_chunk,))?;
+                    }
+                }
+            }
+
             let rb_headers = build_ruby_headers(ruby, &response.headers);
 
             // Create a SharableStringIO with the response body (zero-copy move)
@@ -244,6 +272,16 @@ impl HttpClient {
                 |chunk| {
                     let rb_chunk = ruby.str_from_slice(chunk);
                     let _ = block_proc.call::<_, Value>((rb_chunk,));
+                    // Notify on_data listeners for each chunk
+                    if let Some(ref listeners) = on_data_listeners {
+                        let len = listeners.len();
+                        for i in 0..len {
+                            let listener: Value = unsafe {
+                                Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                            };
+                            let _ = listener.funcall::<_, _, Value>("call", (rb_chunk,));
+                        }
+                    }
                 },
             )
             .map_err(|e| -> Error { e.into() })?;
@@ -264,6 +302,20 @@ impl HttpClient {
                 read_timeout_ms,
             )
             .map_err(|e| -> Error { e.into() })?;
+
+            // Notify on_data listeners with the complete body
+            if let Some(ref listeners) = on_data_listeners {
+                if !response.body.is_empty() {
+                    let rb_chunk = ruby.str_from_slice(&response.body);
+                    let len = listeners.len();
+                    for i in 0..len {
+                        let listener: Value = unsafe {
+                            Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                        };
+                        let _: Value = listener.funcall("call", (rb_chunk,))?;
+                    }
+                }
+            }
 
             let rb_headers = build_ruby_headers(ruby, &response.headers);
             let rb_body = ruby.str_from_slice(&response.body);

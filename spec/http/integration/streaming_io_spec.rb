@@ -195,4 +195,93 @@ RSpec.describe "streaming_io integration" do
       expect(body_io.read).to eq(buffered_body)
     end
   end
+
+  describe "on_data listeners" do
+    it "calls on_data listeners with the body in buffered mode" do
+      received = []
+      listener = ->(chunk) { received << chunk }
+
+      _status, _headers, body = @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_data: [listener]
+      )
+
+      expect(received.size).to eq(1)
+      expect(received.first).to eq(body)
+    end
+
+    it "calls on_data listeners with the body in streaming_io mode" do
+      received = []
+      listener = ->(chunk) { received << chunk }
+
+      _status, _headers, body_io = @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        streaming_io: true, on_data: [listener]
+      )
+
+      expect(received.size).to eq(1)
+      expect(received.first).to eq(body_io.read)
+    end
+
+    it "calls multiple on_data listeners" do
+      received_a = []
+      received_b = []
+      listener_a = ->(chunk) { received_a << chunk }
+      listener_b = ->(chunk) { received_b << chunk }
+
+      @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_data: [listener_a, listener_b]
+      )
+
+      expect(received_a).not_to be_empty
+      expect(received_b).not_to be_empty
+      expect(received_a).to eq(received_b)
+    end
+
+    it "calls on_data listeners per chunk in block streaming mode" do
+      block_chunks = []
+      listener_chunks = []
+      listener = ->(chunk) { listener_chunks << chunk }
+
+      @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_data: [listener]
+      ) { |chunk| block_chunks << chunk }
+
+      expect(listener_chunks).to eq(block_chunks)
+    end
+
+    it "does not call on_data for empty bodies" do
+      received = []
+      listener = ->(chunk) { received << chunk }
+
+      @client.request(
+        @server.endpoint, "HEAD", "/empty", [host_header],
+        on_data: [listener]
+      )
+
+      expect(received).to be_empty
+    end
+
+    it "works with nil on_data (no-op)" do
+      status, _headers, body = @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_data: nil
+      )
+
+      expect(status).to eq(200)
+      expect(body).to be_a(String)
+    end
+
+    it "works with empty on_data array (no-op)" do
+      status, _headers, body = @client.request(
+        @server.endpoint, "GET", "/test", [host_header],
+        on_data: []
+      )
+
+      expect(status).to eq(200)
+      expect(body).to be_a(String)
+    end
+  end
 end
