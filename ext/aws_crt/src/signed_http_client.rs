@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use magnus::prelude::*;
-use magnus::rb_sys::AsRawValue;
-use magnus::scan_args::scan_args;
+use magnus::rb_sys::{AsRawValue, FromRawValue};
+use magnus::scan_args::{get_kwargs, scan_args};
 use magnus::typed_data::{self, DataType, DataTypeFunctions, TypedData};
 use magnus::value::Lazy;
 use magnus::{data_type_builder, method, Error, RArray, RClass, RHash, RString, Ruby, Symbol, Value};
@@ -36,7 +36,9 @@ use crate::http::{
     aws_http_message_set_request_method, aws_http_message_set_request_path,
     aws_input_stream_new_from_cursor, aws_input_stream_release,
 };
+use crate::http_client::compute_checksum;
 use crate::proxy::{ProxyAuthType, ProxyOptions};
+use crate::sharable_string_io::SharableStringIO;
 use crate::sigv4_signer::sign_crt_message;
 use crate::tls::TlsOptions;
 
@@ -172,35 +174,100 @@ impl SignedHttpClient {
         Ok(typed_data::Obj::wrap(client))
     }
 
-    /// Ruby: `client.request(endpoint, method, path, headers, body, credentials, &block)`
+    /// Ruby: `client.request(endpoint, method, path, headers, body = nil,
+    ///          region:, access_key_id:, secret_access_key:, session_token: nil,
+    ///          streaming_io: false, on_data: nil, on_headers: nil,
+    ///          checksum_algorithms: nil, &block)`
     ///
-    /// credentials is a Hash with:
-    ///   :region (required)
-    ///   :access_key_id (required)
-    ///   :secret_access_key (required)
-    ///   :session_token (optional)
-    ///
-    /// Buffered: returns [status_code, headers_array, body_string]
-    /// Streaming (block given): returns [status_code, headers_array]
+    /// Always returns an `AwsCrt::Http::Response` instance.
     fn rb_request(
         ruby: &Ruby,
         rb_self: typed_data::Obj<Self>,
         args: &[Value],
     ) -> Result<Value, Error> {
-        // Parse: endpoint, method, path, headers, body, credentials
-        let args = scan_args::<(String, String, String, RArray, Value, RHash), (), (), (), (), ()>(args)?;
+        // Parse: endpoint, method, path, headers (required), body (optional), + kwargs
+        let args = scan_args::<(String, String, String, RArray), (Option<Value>,), (), (), RHash, ()>(args)?;
         let endpoint = args.required.0;
         let method = args.required.1;
         let path = args.required.2;
         let headers_arr = args.required.3;
-        let body_val = args.required.4;
-        let credentials = args.required.5;
+        let body_val = args.optional.0;
 
-        // Extract credentials
-        let region = hash_get_string_required(&credentials, "region")?;
-        let access_key_id = hash_get_string_required(&credentials, "access_key_id")?;
-        let secret_access_key = hash_get_string_required(&credentials, "secret_access_key")?;
-        let session_token = hash_get_string(&credentials, "session_token")?;
+        // Extract keyword arguments
+        let kwargs = get_kwargs::<_, (String, String, String), (Option<String>, Option<bool>, Option<Value>, Option<Value>, Option<Value>), ()>(
+            args.keywords,
+            &["region", "access_key_id", "secret_access_key"],
+            &["session_token", "streaming_io", "on_data", "on_headers", "checksum_algorithms"],
+        )?;
+        let (region, access_key_id, secret_access_key) = kwargs.required;
+        let (session_token, streaming_io_opt, on_data_opt, on_headers_opt, checksum_algorithms_opt) = kwargs.optional;
+        let streaming_io = streaming_io_opt.unwrap_or(false);
+
+        // Extract on_data listeners (Array of Procs or nil)
+        let on_data_listeners: Option<RArray> = match on_data_opt {
+            Some(v) if !v.is_nil() => {
+                let arr = RArray::from_value(v).ok_or_else(|| {
+                    Error::new(
+                        magnus::exception::type_error(),
+                        "on_data must be an Array of callable objects",
+                    )
+                })?;
+                if arr.len() > 0 { Some(arr) } else { None }
+            }
+            _ => None,
+        };
+
+        // Extract on_headers listeners (Array of Procs or nil)
+        let on_headers_listeners: Option<RArray> = match on_headers_opt {
+            Some(v) if !v.is_nil() => {
+                let arr = RArray::from_value(v).ok_or_else(|| {
+                    Error::new(
+                        magnus::exception::type_error(),
+                        "on_headers must be an Array of callable objects",
+                    )
+                })?;
+                if arr.len() > 0 { Some(arr) } else { None }
+            }
+            _ => None,
+        };
+
+        // Extract checksum_algorithms (Array of Strings or nil)
+        let checksum_algorithms: Option<Vec<String>> = match checksum_algorithms_opt {
+            Some(v) if !v.is_nil() => {
+                let arr = RArray::from_value(v).ok_or_else(|| {
+                    Error::new(
+                        magnus::exception::type_error(),
+                        "checksum_algorithms must be an Array of Strings",
+                    )
+                })?;
+                let len = arr.len();
+                if len == 0 {
+                    None
+                } else {
+                    let mut algs = Vec::with_capacity(len);
+                    for i in 0..len {
+                        let val: Value = unsafe {
+                            Value::from_raw(*rb_sys::RARRAY_CONST_PTR(arr.as_raw()).add(i))
+                        };
+                        let s: String = magnus::TryConvert::try_convert(val)?;
+                        algs.push(s);
+                    }
+                    Some(algs)
+                }
+            }
+            _ => None,
+        };
+
+        // Check if a block was given
+        let block = ruby.block_given();
+
+        // Validate: streaming_io and block are mutually exclusive
+        if streaming_io && block {
+            return Err(Error::new(
+                magnus::exception::arg_error(),
+                "streaming_io and block are mutually exclusive",
+            ));
+        }
 
         // Get or create connection manager
         let cm_ptr = rb_self.get_or_create_pool(&endpoint)?;
@@ -234,14 +301,15 @@ impl SignedHttpClient {
         }
 
         // Get body bytes (copy into Rust before releasing GVL)
-        let body_bytes: Option<Vec<u8>> = if body_val.is_nil() {
-            None
-        } else {
-            let s = RString::from_value(body_val).ok_or_else(|| {
-                Error::new(magnus::exception::type_error(), "body must be a String or nil")
-            })?;
-            let slice = unsafe { s.as_slice() };
-            if slice.is_empty() { None } else { Some(slice.to_vec()) }
+        let body_bytes: Option<Vec<u8>> = match body_val {
+            Some(v) if !v.is_nil() => {
+                let s = RString::from_value(v).ok_or_else(|| {
+                    Error::new(magnus::exception::type_error(), "body must be a String or nil")
+                })?;
+                let slice = unsafe { s.as_slice() };
+                if slice.is_empty() { None } else { Some(slice.to_vec()) }
+            }
+            _ => None,
         };
 
         // --- Build CRT HTTP message ---
@@ -290,9 +358,9 @@ impl SignedHttpClient {
         // Set body stream if provided
         let mut body_stream: *mut AwsInputStream = std::ptr::null_mut();
         let body_data: Option<Vec<u8>>;
-        if let Some(owned) = body_bytes {
+        if let Some(ref owned) = body_bytes {
             if !owned.is_empty() {
-                let cursor = AwsByteCursor::from_slice(&owned);
+                let cursor = AwsByteCursor::from_slice(owned);
                 body_stream = unsafe {
                     aws_input_stream_new_from_cursor(allocator, &cursor)
                 };
@@ -301,13 +369,9 @@ impl SignedHttpClient {
                     return Err(CrtError::last_error().into());
                 }
                 unsafe { aws_http_message_set_body_stream(request, body_stream) };
-                body_data = Some(owned);
-            } else {
-                body_data = None;
             }
-        } else {
-            body_data = None;
         }
+        body_data = body_bytes;
 
         // --- Sign the message in-place ---
         let creds_provider = CredentialsProvider::new_static(
@@ -344,11 +408,64 @@ impl SignedHttpClient {
         }
 
         // --- Send the signed message directly ---
-        // The message is already built and signed — hand it off to the
-        // HTTP layer without converting back to Ruby types.
-        let block = ruby.block_given();
+        if streaming_io {
+            // streaming_io path: send buffered, wrap body in SharableStringIO
+            let response = unsafe {
+                http::send_pre_built_request(
+                    cm_ptr,
+                    request,
+                    body_stream,
+                    body_data,
+                    read_timeout_ms,
+                )
+            }
+            .map_err(|e| -> Error { e.into() })?;
 
-        if block {
+            // Compute checksum over the body buffer
+            let (checksum_algorithm, computed_checksum) =
+                compute_checksum(&checksum_algorithms, &response.headers, &response.body);
+
+            let rb_headers = build_ruby_headers(ruby, &response.headers);
+
+            // Call on_headers listeners
+            if let Some(ref listeners) = on_headers_listeners {
+                let status_val = ruby.into_value(response.status_code);
+                let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                let len = listeners.len();
+                for i in 0..len {
+                    let listener: Value = unsafe {
+                        Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                    };
+                    let _: Value = listener.funcall("call", (status_val, rb_headers_value))?;
+                }
+            }
+
+            // Notify on_data listeners with the complete body
+            if let Some(ref listeners) = on_data_listeners {
+                if !response.body.is_empty() {
+                    let rb_chunk = ruby.str_from_slice(&response.body);
+                    let len = listeners.len();
+                    for i in 0..len {
+                        let listener: Value = unsafe {
+                            Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                        };
+                        let _: Value = listener.funcall("call", (rb_chunk,))?;
+                    }
+                }
+            }
+
+            // Create a SharableStringIO with the response body (zero-copy move)
+            let sio = SharableStringIO::new_with_buffer(response.body);
+
+            let resp_obj = crate::http_response::HttpResponse::new_from_parts(
+                response.status_code,
+                rb_headers.as_raw(),
+                sio.as_value().as_raw(),
+                checksum_algorithm,
+                computed_checksum,
+            );
+            Ok(resp_obj.as_value())
+        } else if block {
             let block_proc = ruby.block_proc()?;
 
             let mut captured_status: i32 = 0;
@@ -368,6 +485,16 @@ impl SignedHttpClient {
                     |chunk| {
                         let rb_chunk = ruby.str_from_slice(chunk);
                         let _ = block_proc.call::<_, Value>((rb_chunk,));
+                        // Notify on_data listeners for each chunk
+                        if let Some(ref listeners) = on_data_listeners {
+                            let len = listeners.len();
+                            for i in 0..len {
+                                let listener: Value = unsafe {
+                                    Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                                };
+                                let _ = listener.funcall::<_, _, Value>("call", (rb_chunk,));
+                            }
+                        }
                     },
                 )
             };
@@ -375,6 +502,20 @@ impl SignedHttpClient {
             send_result.map_err(|e| -> Error { e.into() })?;
 
             let rb_headers = build_ruby_headers(ruby, &captured_headers);
+
+            // Call on_headers listeners
+            if let Some(ref listeners) = on_headers_listeners {
+                let status_val = ruby.into_value(captured_status);
+                let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                let len = listeners.len();
+                for i in 0..len {
+                    let listener: Value = unsafe {
+                        Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                    };
+                    let _: Value = listener.funcall("call", (status_val, rb_headers_value))?;
+                }
+            }
+
             let resp_obj = crate::http_response::HttpResponse::new_from_parts(
                 captured_status,
                 rb_headers.as_raw(),
@@ -384,6 +525,7 @@ impl SignedHttpClient {
             );
             Ok(resp_obj.as_value())
         } else {
+            // Buffered (default) path
             let response = unsafe {
                 http::send_pre_built_request(
                     cm_ptr,
@@ -395,14 +537,46 @@ impl SignedHttpClient {
             }
             .map_err(|e| -> Error { e.into() })?;
 
+            // Compute checksum over the body buffer
+            let (checksum_algorithm, computed_checksum) =
+                compute_checksum(&checksum_algorithms, &response.headers, &response.body);
+
             let rb_headers = build_ruby_headers(ruby, &response.headers);
+
+            // Call on_headers listeners
+            if let Some(ref listeners) = on_headers_listeners {
+                let status_val = ruby.into_value(response.status_code);
+                let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                let len = listeners.len();
+                for i in 0..len {
+                    let listener: Value = unsafe {
+                        Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                    };
+                    let _: Value = listener.funcall("call", (status_val, rb_headers_value))?;
+                }
+            }
+
+            // Notify on_data listeners with the complete body
+            if let Some(ref listeners) = on_data_listeners {
+                if !response.body.is_empty() {
+                    let rb_chunk = ruby.str_from_slice(&response.body);
+                    let len = listeners.len();
+                    for i in 0..len {
+                        let listener: Value = unsafe {
+                            Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                        };
+                        let _: Value = listener.funcall("call", (rb_chunk,))?;
+                    }
+                }
+            }
+
             let rb_body = ruby.str_from_slice(&response.body);
             let resp_obj = crate::http_response::HttpResponse::new_from_parts(
                 response.status_code,
                 rb_headers.as_raw(),
                 rb_body.as_value().as_raw(),
-                None,
-                None,
+                checksum_algorithm,
+                computed_checksum,
             );
             Ok(resp_obj.as_value())
         }

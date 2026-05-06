@@ -102,35 +102,46 @@ module AwsCrt
     # @param headers [Array<Array(String, String)>] Request headers as
     #   [name, value] pairs. Must include a "host" header.
     # @param body [String, nil] Request body
-    # @param credentials [Hash] Signing credentials:
+    # @param credentials [Hash] Signing credentials and options:
     # @option credentials [String] :region (required) AWS region
     # @option credentials [String] :access_key_id (required)
     # @option credentials [String] :secret_access_key (required)
     # @option credentials [String] :session_token (nil)
+    # @option credentials [Boolean] :streaming_io (false) Return body as
+    #   SharableStringIO instead of String
+    # @option credentials [Array<#call>] :on_data (nil) Listeners called
+    #   with each body chunk
+    # @option credentials [Array<#call>] :on_headers (nil) Listeners called
+    #   with (status, headers_hash) when headers arrive
+    # @option credentials [Array<String>] :checksum_algorithms (nil)
+    #   Algorithms to compute over the response body
     #
     # @yield [chunk] For streaming responses, yields each body chunk
     # @yieldparam chunk [String] A chunk of the response body
     #
-    # @return [Array] Buffered: [status_code, headers, body]
-    #   Streaming: [status_code, headers]
+    # @return [AwsCrt::Http::Response] The HTTP response
     #
     # @raise [ArgumentError] if required options are missing
     # @raise [AwsCrt::Http::Error] on HTTP errors
-    def request(endpoint, method, path, headers, body = nil, **credentials, &block) # rubocop:disable Metrics/ParameterLists,Metrics/MethodLength
-      validate_credentials!(credentials)
+    def request(endpoint, method, path, headers, body = nil, **options, &block) # rubocop:disable Metrics/ParameterLists,Metrics/MethodLength
+      validate_credentials!(options)
       validate_headers!(headers)
 
-      creds_hash = {
-        region: credentials[:region],
-        access_key_id: credentials[:access_key_id],
-        secret_access_key: credentials[:secret_access_key],
-        session_token: credentials[:session_token]
+      kwargs = {
+        region: options[:region],
+        access_key_id: options[:access_key_id],
+        secret_access_key: options[:secret_access_key]
       }
+      kwargs[:session_token] = options[:session_token] if options[:session_token]
+      kwargs[:streaming_io] = options[:streaming_io] if options.key?(:streaming_io)
+      kwargs[:on_data] = options[:on_data] if options.key?(:on_data)
+      kwargs[:on_headers] = options[:on_headers] if options.key?(:on_headers)
+      kwargs[:checksum_algorithms] = options[:checksum_algorithms] if options.key?(:checksum_algorithms)
 
       if block
-        _native_request(endpoint, method, path, headers, body, creds_hash, &block)
+        _native_request(endpoint, method, path, headers, body, **kwargs, &block)
       else
-        _native_request(endpoint, method, path, headers, body, creds_hash)
+        _native_request(endpoint, method, path, headers, body, **kwargs)
       end
     end
 

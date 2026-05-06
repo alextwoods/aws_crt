@@ -489,7 +489,7 @@ impl HttpClient {
 ///
 /// Returns (algorithm_name, base64_checksum) if a matching header was found,
 /// or (None, None) if no match.
-fn compute_checksum(
+pub fn compute_checksum(
     algorithms: &Option<Vec<String>>,
     response_headers: &[(String, String)],
     body: &[u8],
@@ -521,7 +521,7 @@ fn compute_checksum(
 
 /// Compute the checksum for a specific algorithm over the given data.
 /// Returns the base64-encoded result, or None if the algorithm is unknown.
-fn compute_checksum_for_algorithm(algorithm: &str, data: &[u8]) -> Option<String> {
+pub fn compute_checksum_for_algorithm(algorithm: &str, data: &[u8]) -> Option<String> {
     let engine = base64::engine::general_purpose::STANDARD;
 
     match algorithm.to_uppercase().as_str() {
@@ -558,13 +558,13 @@ fn compute_checksum_for_algorithm(algorithm: &str, data: &[u8]) -> Option<String
     }
 }
 
-enum ShaAlgorithm {
+pub enum ShaAlgorithm {
     Sha1,
     Sha256,
 }
 
 /// Compute SHA1 or SHA256 using the CRT one-shot functions.
-fn compute_sha_checksum(data: &[u8], algorithm: ShaAlgorithm) -> Option<String> {
+pub fn compute_sha_checksum(data: &[u8], algorithm: ShaAlgorithm) -> Option<String> {
     let engine = base64::engine::general_purpose::STANDARD;
 
     unsafe {

@@ -322,4 +322,245 @@ RSpec.describe AwsCrt::SignedHttpClient do
       expect(auth1).not_to eq(auth2)
     end
   end
+
+  describe "streaming_io" do
+    let(:server) { TestServer.start }
+    let(:endpoint) { server.endpoint }
+
+    after { server.stop }
+
+    let(:client) { described_class.new(service: "sts") }
+
+    it "returns a SharableStringIO body when streaming_io: true" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+
+      response = client.request(
+        endpoint, "GET", "/streaming-io", headers, nil,
+        **credentials, streaming_io: true
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(response.body).to be_a(AwsCrt::Http::SharableStringIO)
+      expect(response.body.read).to include("/streaming-io")
+    end
+
+    it "returns a frozen, Ractor-shareable SharableStringIO" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+
+      response = client.request(
+        endpoint, "GET", "/sio-frozen", headers, nil,
+        **credentials, streaming_io: true
+      )
+
+      sio = response.body
+      expect(sio).to be_frozen
+      expect(Ractor.shareable?(sio)).to be true
+    end
+
+    it "raises ArgumentError when streaming_io and block are both given" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+
+      expect {
+        client.request(
+          endpoint, "GET", "/test", headers, nil,
+          **credentials, streaming_io: true
+        ) { |_chunk| }
+      }.to raise_error(ArgumentError, "streaming_io and block are mutually exclusive")
+    end
+  end
+
+  describe "on_data" do
+    let(:server) { TestServer.start }
+    let(:endpoint) { server.endpoint }
+
+    after { server.stop }
+
+    let(:client) { described_class.new(service: "sts") }
+
+    it "calls on_data listeners with the response body in buffered mode" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+      received = []
+      listener = ->(chunk) { received << chunk }
+
+      response = client.request(
+        endpoint, "GET", "/on-data-test", headers, nil,
+        **credentials, on_data: [listener]
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(received.join).to include("/on-data-test")
+    end
+
+    it "calls on_data listeners in streaming_io mode" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+      received = []
+      listener = ->(chunk) { received << chunk }
+
+      response = client.request(
+        endpoint, "GET", "/on-data-sio", headers, nil,
+        **credentials, streaming_io: true, on_data: [listener]
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(received.join).to include("/on-data-sio")
+    end
+
+    it "calls on_data listeners for each chunk in block mode" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+      block_chunks = []
+      listener_chunks = []
+      listener = ->(chunk) { listener_chunks << chunk }
+
+      client.request(
+        endpoint, "GET", "/on-data-block", headers, nil,
+        **credentials, on_data: [listener]
+      ) { |chunk| block_chunks << chunk }
+
+      expect(block_chunks.join).to include("/on-data-block")
+      expect(listener_chunks.join).to include("/on-data-block")
+    end
+
+    it "calls multiple on_data listeners" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+      received1 = []
+      received2 = []
+      listener1 = ->(chunk) { received1 << chunk }
+      listener2 = ->(chunk) { received2 << chunk }
+
+      client.request(
+        endpoint, "GET", "/multi-listener", headers, nil,
+        **credentials, on_data: [listener1, listener2]
+      )
+
+      expect(received1.join).to include("/multi-listener")
+      expect(received2.join).to include("/multi-listener")
+    end
+  end
+
+  describe "on_headers" do
+    let(:server) { TestServer.start }
+    let(:endpoint) { server.endpoint }
+
+    after { server.stop }
+
+    let(:client) { described_class.new(service: "sts") }
+
+    it "calls on_headers listeners with (status, headers_hash) in buffered mode" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+      received = []
+      listener = ->(status, hdrs) { received << [status, hdrs] }
+
+      response = client.request(
+        endpoint, "GET", "/on-headers-test", headers, nil,
+        **credentials, on_headers: [listener]
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(received.length).to eq(1)
+      expect(received[0][0]).to eq(200)
+      expect(received[0][1]).to be_a(Hash)
+      expect(received[0][1]).to have_key("Content-Type")
+    end
+
+    it "calls on_headers listeners in streaming_io mode" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+      received = []
+      listener = ->(status, hdrs) { received << [status, hdrs] }
+
+      response = client.request(
+        endpoint, "GET", "/on-headers-sio", headers, nil,
+        **credentials, streaming_io: true, on_headers: [listener]
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(received.length).to eq(1)
+      expect(received[0][0]).to eq(200)
+      expect(received[0][1]).to be_a(Hash)
+    end
+
+    it "calls on_headers listeners in block mode" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+      received = []
+      listener = ->(status, hdrs) { received << [status, hdrs] }
+
+      client.request(
+        endpoint, "GET", "/on-headers-block", headers, nil,
+        **credentials, on_headers: [listener]
+      ) { |_chunk| }
+
+      expect(received.length).to eq(1)
+      expect(received[0][0]).to eq(200)
+      expect(received[0][1]).to be_a(Hash)
+    end
+  end
+
+  describe "checksum_algorithms" do
+    let(:server) { TestServer.start }
+    let(:endpoint) { server.endpoint }
+
+    after { server.stop }
+
+    let(:client) { described_class.new(service: "sts") }
+
+    it "computes CRC32 checksum when the response has the matching header" do
+      headers = [
+        ["host", "127.0.0.1:#{server.port}"],
+        ["X-Add-Checksum", "CRC32"]
+      ]
+
+      response = client.request(
+        endpoint, "GET", "/checksum-crc32", headers, nil,
+        **credentials, checksum_algorithms: ["CRC32"]
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(response.checksum_algorithm).to eq("CRC32")
+      expect(response.computed_checksum).not_to be_nil
+    end
+
+    it "computes SHA256 checksum when the response has the matching header" do
+      headers = [
+        ["host", "127.0.0.1:#{server.port}"],
+        ["X-Add-Checksum", "SHA256"]
+      ]
+
+      response = client.request(
+        endpoint, "GET", "/checksum-sha256", headers, nil,
+        **credentials, checksum_algorithms: ["SHA256"]
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(response.checksum_algorithm).to eq("SHA256")
+      expect(response.computed_checksum).not_to be_nil
+    end
+
+    it "computes checksum in streaming_io mode" do
+      headers = [
+        ["host", "127.0.0.1:#{server.port}"],
+        ["X-Add-Checksum", "CRC32"]
+      ]
+
+      response = client.request(
+        endpoint, "GET", "/checksum-sio", headers, nil,
+        **credentials, streaming_io: true, checksum_algorithms: ["CRC32"]
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(response.checksum_algorithm).to eq("CRC32")
+      expect(response.computed_checksum).not_to be_nil
+    end
+
+    it "returns nil checksum when no matching header is present" do
+      headers = [["host", "127.0.0.1:#{server.port}"]]
+
+      response = client.request(
+        endpoint, "GET", "/no-checksum", headers, nil,
+        **credentials, checksum_algorithms: ["CRC32"]
+      )
+
+      expect(response.status_code).to eq(200)
+      expect(response.checksum_algorithm).to be_nil
+      expect(response.computed_checksum).to be_nil
+    end
+  end
 end
