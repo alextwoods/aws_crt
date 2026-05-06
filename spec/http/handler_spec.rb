@@ -159,6 +159,10 @@ module HandlerStubs
     def [](key)
       @metadata[key]
     end
+
+    def []=(key, value)
+      @metadata[key] = value
+    end
   end
 end
 
@@ -176,7 +180,7 @@ RSpec.describe AwsCrt::Http::Handler do
     AwsCrt::Http::Client.new
   end
 
-  def build_context(method:, path:, headers: [], body: nil, streaming: false, logger: nil)
+  def build_context(method:, path:, headers: [], body: nil, streaming: false, logger: nil, metadata: nil)
     uri = URI("http://127.0.0.1:#{@port}#{path}")
     stub_headers = HandlerStubs::Headers.new(
       [["Host", "127.0.0.1:#{@port}"]] + headers
@@ -188,12 +192,18 @@ RSpec.describe AwsCrt::Http::Handler do
       crt_http_client: make_client,
       logger: logger
     )
-    metadata = streaming ? { response_target: proc {} } : {}
+    ctx_metadata = if metadata
+                     metadata
+                   elsif streaming
+                     { response_target: StringIO.new }
+                   else
+                     {}
+                   end
     HandlerStubs::Context.new(
       http_request: request,
       http_response: response,
       config: config,
-      metadata: metadata
+      metadata: ctx_metadata
     )
   end
 
@@ -497,6 +507,89 @@ RSpec.describe AwsCrt::Http::Handler do
       expect(sio.eof?).to be false
       sio.read
       expect(sio.eof?).to be true
+    end
+  end
+
+  describe "response_target integration" do
+    it "passes response_target from context to CRT client" do
+      target = proc { |_body, _headers| }
+      context = build_context(
+        method: "GET",
+        path: "/target-pass",
+        metadata: { response_target: target }
+      )
+
+      # Use a spy client that records the keyword arguments
+      received_kwargs = nil
+      real_client = make_client
+      real_response = real_client.request(
+        "http://127.0.0.1:#{@port}", "GET", "/spy-setup",
+        [["Host", "127.0.0.1:#{@port}"]],
+        streaming_io: true
+      )
+
+      spy_client = Object.new
+      spy_client.define_singleton_method(:request) do |*args, **kwargs|
+        received_kwargs = kwargs
+        real_response
+      end
+      context.config.crt_http_client = spy_client
+
+      handler = described_class.new
+      handler.call(context)
+
+      expect(received_kwargs).to include(response_target: target)
+      expect(received_kwargs).to include(streaming_io: true)
+    end
+
+    it "omits response_target when context has none" do
+      context = build_context(
+        method: "GET",
+        path: "/no-target",
+        metadata: {}
+      )
+
+      # Use a spy client that records the keyword arguments
+      received_kwargs = nil
+      real_client = make_client
+      real_response = real_client.request(
+        "http://127.0.0.1:#{@port}", "GET", "/spy-setup",
+        [["Host", "127.0.0.1:#{@port}"]],
+        streaming_io: true
+      )
+
+      spy_client = Object.new
+      spy_client.define_singleton_method(:request) do |*args, **kwargs|
+        received_kwargs = kwargs
+        real_response
+      end
+      context.config.crt_http_client = spy_client
+
+      handler = described_class.new
+      handler.call(context)
+
+      expect(received_kwargs).to eq({ streaming_io: true })
+      expect(received_kwargs).not_to have_key(:response_target)
+    end
+
+    it "propagates response_target_info to context" do
+      target = proc { |_body, _headers| }
+      context = build_context(
+        method: "POST",
+        path: "/target-info",
+        headers: [["Content-Length", "4"]],
+        body: StringIO.new("test"),
+        metadata: { response_target: target }
+      )
+
+      handler = described_class.new
+      handler.call(context)
+
+      resp = context.http_response
+      expect(resp.error).to be_nil, "unexpected error: #{resp.error.inspect}"
+      # The echo server returns 200, so the Proc target is applied
+      # and response_target_info should be populated
+      expect(context[:response_target_info]).to eq({ type: :proc })
     end
   end
 

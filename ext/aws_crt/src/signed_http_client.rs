@@ -463,6 +463,7 @@ impl SignedHttpClient {
                 sio.as_value().as_raw(),
                 checksum_algorithm,
                 computed_checksum,
+                rb_sys::Qnil as VALUE,
             );
             Ok(resp_obj.as_value())
         } else if block {
@@ -522,6 +523,7 @@ impl SignedHttpClient {
                 ruby.qnil().as_value().as_raw(),
                 None,
                 None,
+                rb_sys::Qnil as VALUE,
             );
             Ok(resp_obj.as_value())
         } else {
@@ -577,6 +579,7 @@ impl SignedHttpClient {
                 rb_body.as_value().as_raw(),
                 checksum_algorithm,
                 computed_checksum,
+                rb_sys::Qnil as VALUE,
             );
             Ok(resp_obj.as_value())
         }

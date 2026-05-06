@@ -20,7 +20,7 @@ module AwsCrt
         client = context.config.crt_http_client
         resp = context.http_response
         start = monotonic_time
-        send_request(client, context.http_request, resp, streaming?(context))
+        send_request(client, context.http_request, resp, streaming?(context), context)
         log_request(context, start)
       rescue AwsCrt::Http::Error => e
         context.http_response.signal_error(
@@ -32,14 +32,17 @@ module AwsCrt
 
       private
 
-      def send_request(client, req, resp, streaming)
+      def send_request(client, req, resp, streaming, context)
         endpoint = "#{req.endpoint.scheme}://#{req.endpoint.host}:#{req.endpoint.port}"
         method = req.http_method
         path = req.endpoint.request_uri
         headers = build_headers(req)
         body = read_body(req.body)
+        response_target = context[:response_target]
 
-        if streaming
+        if response_target && !streaming
+          target_response(client, endpoint, method, path, headers, body, resp, response_target, context)
+        elsif streaming
           stream_response(client, endpoint, method, path, headers, body, resp)
         else
           buffer_response(client, endpoint, method, path, headers, body, resp)
@@ -53,6 +56,16 @@ module AwsCrt
         resp.signal_headers(response.status_code, response.headers)
         resp.signal_data(response.body.read) unless response.body.size.zero?
         resp.signal_done
+      end
+
+      def target_response(client, endpoint, method, path, headers, body, resp, target, context) # rubocop:disable Metrics/ParameterLists
+        args = [endpoint, method, path, headers]
+        args << body unless body.nil?
+        response = client.request(*args, streaming_io: true, response_target: target)
+        resp.signal_headers(response.status_code, response.headers)
+        resp.signal_data(response.body.read) unless response.body.size.zero?
+        resp.signal_done
+        context[:response_target_info] = response.response_target_info
       end
 
       def stream_response(client, endpoint, method, path, headers, body, resp) # rubocop:disable Metrics/ParameterLists
@@ -81,8 +94,8 @@ module AwsCrt
 
       def streaming?(context)
         target = context[:response_target]
-        target.is_a?(Proc) ||
-          (target.respond_to?(:write) && target.respond_to?(:close))
+        !target.is_a?(Proc) &&
+          target.respond_to?(:write) && target.respond_to?(:close)
       end
 
       def log_request(context, start_time)

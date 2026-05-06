@@ -30,6 +30,11 @@ pub struct HttpResponse {
     checksum_algorithm: Option<String>,
     /// The computed checksum value (base64-encoded), or nil.
     computed_checksum: Option<String>,
+    /// Response target info as Ruby VALUE (RHash or Qnil).
+    /// Describes what response_target action was taken (e.g. {type: :proc},
+    /// {type: :file, path: "..."}, or {type: :offset_file, path: "...", offset: N}).
+    /// Nil when no response_target was used or when the response was non-2xx.
+    response_target_info: rb_sys::VALUE,
 }
 
 // SAFETY: The Ruby VALUEs stored here are GC-protected by being reachable
@@ -43,6 +48,7 @@ impl DataTypeFunctions for HttpResponse {
         unsafe {
             rb_sys::rb_gc_mark(self.headers);
             rb_sys::rb_gc_mark(self.body);
+            rb_sys::rb_gc_mark(self.response_target_info);
         }
     }
 }
@@ -85,6 +91,7 @@ impl HttpResponse {
         body: rb_sys::VALUE,
         checksum_algorithm: Option<String>,
         computed_checksum: Option<String>,
+        response_target_info: rb_sys::VALUE,
     ) -> typed_data::Obj<Self> {
         typed_data::Obj::wrap(HttpResponse {
             status_code,
@@ -92,6 +99,7 @@ impl HttpResponse {
             body,
             checksum_algorithm,
             computed_checksum,
+            response_target_info,
         })
     }
 
@@ -125,6 +133,14 @@ impl HttpResponse {
             None => ruby.qnil().as_value(),
         }
     }
+
+    /// Ruby: `response.response_target_info` → Hash or nil
+    ///
+    /// Returns a Hash describing the response target action taken, or nil if
+    /// no response target was used or the response was non-2xx.
+    fn rb_response_target_info(&self) -> Value {
+        unsafe { Value::from_raw(self.response_target_info) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +159,7 @@ pub fn define_http_response(
     class.define_method("body", method!(HttpResponse::rb_body, 0))?;
     class.define_method("checksum_algorithm", method!(HttpResponse::rb_checksum_algorithm, 0))?;
     class.define_method("computed_checksum", method!(HttpResponse::rb_computed_checksum, 0))?;
+    class.define_method("response_target_info", method!(HttpResponse::rb_response_target_info, 0))?;
 
     Ok(())
 }

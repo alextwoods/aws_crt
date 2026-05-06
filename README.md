@@ -230,6 +230,7 @@ All request modes return an `AwsCrt::Http::Response` with:
 | `body` | String, SharableStringIO, or nil | Response body (nil in block streaming mode) |
 | `checksum_algorithm` | String or nil | Matched algorithm name (e.g. `"CRC32"`) |
 | `computed_checksum` | String or nil | Base64-encoded computed checksum |
+| `response_target_info` | Hash or nil | Describes what response_target action was taken (see below) |
 
 The `streaming_io: true` option returns an `AwsCrt::Http::SharableStringIO`
 as the body instead of a plain String. This is a read-only, frozen,
@@ -309,6 +310,86 @@ response = client.request(
 
 `on_data: nil` or `on_data: []` is a no-op. Listeners are not called for
 empty response bodies.
+
+#### response_target
+
+Pass `response_target:` to write the response body directly to a destination
+(file, Proc, or offset-file hash) without buffering it in Ruby memory. The
+target is only applied on success (2xx status codes) — error responses are
+returned normally so error messages aren't written to your files or swallowed
+by callbacks.
+
+```ruby
+# Write response body to a file path (GVL released during write)
+response = client.request(
+  "https://example.com", "GET", "/large-file",
+  [["Host", "example.com"]],
+  response_target: "/tmp/download.bin"
+)
+response.body.size  # => 0 (body went to the file)
+response.response_target_info  # => { type: :file, path: "/tmp/download.bin" }
+
+# Write to a Pathname
+response = client.request(
+  "https://example.com", "GET", "/data",
+  [["Host", "example.com"]],
+  response_target: Pathname.new("/tmp/data.bin")
+)
+
+# Write at a byte offset (useful for parallel range downloads)
+response = client.request(
+  "https://example.com", "GET", "/range",
+  [["Host", "example.com"], ["Range", "bytes=1024-2047"]],
+  response_target: { path: "/tmp/assembled.bin", offset: 1024 }
+)
+response.response_target_info  # => { type: :offset_file, path: "/tmp/assembled.bin", offset: 1024 }
+
+# Proc target — called with (body_string, headers_hash) on success
+response = client.request(
+  "https://example.com", "GET", "/callback",
+  [["Host", "example.com"]],
+  response_target: ->(body, headers) { process(body, headers) }
+)
+response.response_target_info  # => { type: :proc }
+
+# Non-success responses ignore the target entirely
+response = client.request(
+  "https://example.com", "GET", "/missing",
+  [["Host", "example.com"]],
+  response_target: "/tmp/output.bin"
+)
+response.status_code           # => 404
+response.body                  # => "Not Found" (error body returned normally)
+response.response_target_info  # => nil (target was not applied)
+File.exist?("/tmp/output.bin") # => false
+```
+
+**Accepted target types:**
+
+| Type | Behavior on 2xx |
+|------|-----------------|
+| `String` | File path — opens, writes body, closes |
+| `Pathname` | Same as String (calls `to_s` for the path) |
+| `File` | Writes body to the file (uses `file.path`) |
+| `Hash` with `:path` and `:offset` | Opens file, seeks to offset, writes body |
+| `Proc` / lambda | Called once with `(body_string, headers_hash)` |
+
+**Constraints:**
+- `response_target` and a streaming block are mutually exclusive (`ArgumentError`)
+- Offset hash requires `:path` (String) and `:offset` (non-negative Integer)
+- File writes release the GVL, allowing other threads/fibers to run concurrently
+
+**Interaction with other features:**
+- `on_data` callbacks still receive the actual body bytes (independent of target)
+- `on_headers` callbacks fire normally
+- `checksum_algorithms` validation runs before target dispatch
+- `streaming_io: true` is accepted alongside `response_target` (determines body format on non-success)
+
+The response object includes a `response_target_info` attribute:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `response_target_info` | Hash or nil | Describes what target action was taken, or nil if no target was used / response was non-2xx |
 
 #### Zero-copy file writes
 

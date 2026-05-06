@@ -20,12 +20,225 @@ use magnus::value::Lazy;
 use magnus::{data_type_builder, method, Error, RArray, RClass, RHash, RString, Ruby, Symbol, Value};
 use rb_sys::VALUE;
 
+// ---------------------------------------------------------------------------
+// FFI declarations
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    fn rb_thread_call_without_gvl(
+        func: unsafe extern "C" fn(data: *mut std::ffi::c_void) -> *mut std::ffi::c_void,
+        data: *mut std::ffi::c_void,
+        ubf: *const std::ffi::c_void,
+        ubf_data: *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+}
+
 use crate::connection_manager::{ConnectionManager, ConnectionManagerOptions};
 use crate::http;
 use crate::http_response::HttpResponse as RubyHttpResponse;
 use crate::proxy::{ProxyAuthType, ProxyOptions};
 use crate::sharable_string_io::SharableStringIO;
 use crate::tls::TlsOptions;
+
+// ---------------------------------------------------------------------------
+// Response Target validation
+// ---------------------------------------------------------------------------
+
+/// The kind of response target provided by the user.
+#[derive(Clone, Debug)]
+pub enum ResponseTargetKind {
+    Proc,
+    FilePath,
+    FileObject,
+    OffsetFile,
+}
+
+/// Validate the `response_target` argument and return its kind.
+///
+/// Accepted types:
+/// - Proc (checked via `is_a?(Proc)`)
+/// - String (file path)
+/// - Pathname (via const lookup on Object)
+/// - File object (checked via `is_a?(File)`)
+/// - Hash with `:path` (String) and `:offset` (non-negative Integer)
+pub fn validate_response_target(ruby: &Ruby, target: Value) -> Result<ResponseTargetKind, Error> {
+    // Check Proc
+    let proc_class = ruby.class_object().const_get::<_, Value>("Proc").map_err(|_| {
+        Error::new(magnus::exception::runtime_error(), "cannot resolve Proc class")
+    })?;
+    let is_proc: bool = target.funcall("is_a?", (proc_class,))?;
+    if is_proc {
+        return Ok(ResponseTargetKind::Proc);
+    }
+
+    // Check String
+    if target.is_kind_of(ruby.class_string()) {
+        return Ok(ResponseTargetKind::FilePath);
+    }
+
+    // Check Hash with :path and :offset (before Pathname to avoid calling methods on Hash)
+    if let Some(hash) = RHash::from_value(target) {
+        validate_offset_hash(&hash)?;
+        return Ok(ResponseTargetKind::OffsetFile);
+    }
+
+    // Check Pathname (via const lookup — Pathname may not be loaded)
+    if let Ok(pathname_class) = ruby.class_object().const_get::<_, Value>("Pathname") {
+        let is_pathname: bool = target.funcall("is_a?", (pathname_class,))?;
+        if is_pathname {
+            return Ok(ResponseTargetKind::FilePath);
+        }
+    }
+
+    // Check File
+    let file_class = ruby.class_object().const_get::<_, Value>("File").map_err(|_| {
+        Error::new(magnus::exception::runtime_error(), "cannot resolve File class")
+    })?;
+    let is_file: bool = target.funcall("is_a?", (file_class,))?;
+    if is_file {
+        return Ok(ResponseTargetKind::FileObject);
+    }
+
+    Err(Error::new(
+        magnus::exception::arg_error(),
+        "response_target must be a Proc, String, Pathname, File, or Hash with :path and :offset keys",
+    ))
+}
+
+/// Validate that an offset hash has the required `:path` (String) and `:offset` (non-negative Integer) keys.
+fn validate_offset_hash(hash: &RHash) -> Result<(), Error> {
+    let path_sym = Symbol::new("path");
+    let offset_sym = Symbol::new("offset");
+
+    // Check :path key
+    let path_val: Option<Value> = hash.lookup(path_sym)?;
+    match path_val {
+        Some(v) if !v.is_nil() => {
+            // Verify it's a String
+            if RString::from_value(v).is_none() {
+                return Err(Error::new(
+                    magnus::exception::arg_error(),
+                    "response_target hash must include :path (String) and :offset (Integer) keys",
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                magnus::exception::arg_error(),
+                "response_target hash must include :path (String) and :offset (Integer) keys",
+            ));
+        }
+    }
+
+    // Check :offset key
+    let offset_val: Option<Value> = hash.lookup(offset_sym)?;
+    match offset_val {
+        Some(v) if !v.is_nil() => {
+            // Try to convert to i64 to check if it's an Integer
+            let offset: i64 = magnus::TryConvert::try_convert(v).map_err(|_| {
+                Error::new(
+                    magnus::exception::arg_error(),
+                    "response_target hash must include :path (String) and :offset (Integer) keys",
+                )
+            })?;
+            if offset < 0 {
+                return Err(Error::new(
+                    magnus::exception::arg_error(),
+                    "response_target offset must be non-negative",
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                magnus::exception::arg_error(),
+                "response_target hash must include :path (String) and :offset (Integer) keys",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GVL-free file write helper
+// ---------------------------------------------------------------------------
+
+/// Write data to a file at the given byte offset, releasing the GVL during I/O.
+///
+/// This enables the Ruby fiber scheduler to run other fibers while the write
+/// completes. Reuses the same `rb_thread_call_without_gvl` pattern as
+/// `SharableStringIO#write_to_file`.
+///
+/// Returns the number of bytes written on success, or an IOError on failure
+/// with the file path and underlying OS error in the message.
+pub fn write_to_file_gvl_free(path: &str, offset: u64, data: &[u8]) -> Result<usize, Error> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+
+    let path_c = std::ffi::CString::new(path)
+        .map_err(|_| Error::new(magnus::exception::arg_error(), "path contains null byte"))?;
+
+    struct WriteData {
+        path: std::ffi::CString,
+        data: Vec<u8>,
+        offset: u64,
+        result: std::result::Result<usize, std::io::Error>,
+    }
+
+    let mut write_data = WriteData {
+        path: path_c,
+        data: data.to_vec(),
+        offset,
+        result: Ok(0),
+    };
+
+    unsafe extern "C" fn do_write(ptr: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+        let wd = &mut *(ptr as *mut WriteData);
+        wd.result = (|| {
+            use std::fs::OpenOptions;
+            use std::io::{Seek, SeekFrom, Write};
+
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(wd.path.to_str().unwrap())?;
+
+            if wd.offset > 0 {
+                file.seek(SeekFrom::Start(wd.offset))?;
+            }
+            file.write_all(&wd.data)?;
+            Ok(wd.data.len())
+        })();
+        std::ptr::null_mut()
+    }
+
+    // Release GVL during the file write — enables fiber scheduler to
+    // switch to other fibers while this one blocks on I/O.
+    unsafe {
+        rb_thread_call_without_gvl(
+            do_write,
+            &mut write_data as *mut WriteData as *mut std::ffi::c_void,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+    }
+
+    write_data.result.map_err(|e| {
+        if offset > 0 {
+            Error::new(
+                magnus::exception::io_error(),
+                format!("response_target write failed for '{}' at offset {}: {}", path, offset, e),
+            )
+        } else {
+            Error::new(
+                magnus::exception::io_error(),
+                format!("response_target write failed for '{}': {}", path, e),
+            )
+        }
+    })
+}
 
 // ---------------------------------------------------------------------------
 // HttpClient — the Ractor-shareable HTTP client
@@ -145,10 +358,10 @@ impl HttpClient {
         let body = args.optional.0;
 
         // Extract keyword arguments
-        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<Value>, Option<Value>, Option<Value>), ()>(
-            args.keywords, &[], &["streaming_io", "on_data", "on_headers", "checksum_algorithms"]
+        let kwargs = get_kwargs::<_, (), (Option<bool>, Option<Value>, Option<Value>, Option<Value>, Option<Value>), ()>(
+            args.keywords, &[], &["streaming_io", "on_data", "on_headers", "checksum_algorithms", "response_target"]
         )?;
-        let (streaming_io_opt, on_data_opt, on_headers_opt, checksum_algorithms_opt) = kwargs.optional;
+        let (streaming_io_opt, on_data_opt, on_headers_opt, checksum_algorithms_opt, response_target_opt) = kwargs.optional;
         let streaming_io = streaming_io_opt.unwrap_or(false);
 
         // Extract on_data listeners (Array of Procs or nil)
@@ -217,6 +430,22 @@ impl HttpClient {
             ));
         }
 
+        // Validate response_target if provided
+        let response_target_kind: Option<ResponseTargetKind> = match &response_target_opt {
+            Some(v) if !v.is_nil() => {
+                Some(validate_response_target(ruby, *v)?)
+            }
+            _ => None,
+        };
+
+        // Validate: response_target and block are mutually exclusive
+        if response_target_kind.is_some() && block {
+            return Err(Error::new(
+                magnus::exception::arg_error(),
+                "response_target and block are mutually exclusive",
+            ));
+        }
+
         // Get or create connection manager for this endpoint
         let cm_ptr = rb_self.get_or_create_pool(&endpoint)?;
         let read_timeout_ms = rb_self.config.read_timeout_ms;
@@ -257,7 +486,155 @@ impl HttpClient {
             _ => None,
         };
 
-        if streaming_io {
+        if let Some(ref target_kind) = response_target_kind {
+            // response_target path: always use buffered make_request, then
+            // dispatch to target on success (2xx) or return body normally on failure.
+            let response_target_val = response_target_opt.unwrap();
+
+            let response = http::make_request(
+                cm_ptr,
+                &method,
+                &path,
+                &header_vec,
+                body_bytes,
+                read_timeout_ms,
+            )
+            .map_err(|e| -> Error { e.into() })?;
+
+            // Compute checksum over the body buffer
+            let (checksum_algorithm, computed_checksum) =
+                compute_checksum(&checksum_algorithms, &response.headers, &response.body);
+
+            let rb_headers = build_ruby_headers_hash(ruby, &response.headers);
+
+            // Call on_headers listeners
+            if let Some(ref listeners) = on_headers_listeners {
+                let status_val = ruby.into_value(response.status_code);
+                let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                let len = listeners.len();
+                for i in 0..len {
+                    let listener: Value = unsafe {
+                        Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                    };
+                    let _: Value = listener.funcall("call", (status_val, rb_headers_value))?;
+                }
+            }
+
+            // Notify on_data listeners with the actual body bytes
+            if let Some(ref listeners) = on_data_listeners {
+                if !response.body.is_empty() {
+                    let rb_chunk = ruby.str_from_slice(&response.body);
+                    let len = listeners.len();
+                    for i in 0..len {
+                        let listener: Value = unsafe {
+                            Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                        };
+                        let _: Value = listener.funcall("call", (rb_chunk,))?;
+                    }
+                }
+            }
+
+            // Check status code: dispatch to target on 2xx, ignore on non-2xx
+            let is_success = (200..=299).contains(&response.status_code);
+
+            if is_success {
+                // Dispatch to target based on kind
+                let response_target_info_raw: rb_sys::VALUE = match target_kind {
+                    ResponseTargetKind::Proc => {
+                        // Call the Proc with (body_string, headers_hash)
+                        let rb_body_str = ruby.str_from_slice(&response.body);
+                        let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                        let _: Value = response_target_val.funcall("call", (rb_body_str, rb_headers_value))?;
+
+                        // Build response_target_info: { type: :proc }
+                        let info = RHash::new();
+                        let _ = info.aset(Symbol::new("type"), Symbol::new("proc"));
+                        info.as_raw()
+                    }
+                    ResponseTargetKind::FilePath => {
+                        // Extract path string — handle both String and Pathname
+                        let path_str: String = if response_target_val.is_kind_of(ruby.class_string()) {
+                            magnus::TryConvert::try_convert(response_target_val)?
+                        } else {
+                            // Pathname — call to_s
+                            response_target_val.funcall("to_s", ())?
+                        };
+
+                        write_to_file_gvl_free(&path_str, 0, &response.body)?;
+
+                        // Build response_target_info: { type: :file, path: "<path>" }
+                        let info = RHash::new();
+                        let _ = info.aset(Symbol::new("type"), Symbol::new("file"));
+                        let _ = info.aset(Symbol::new("path"), ruby.str_new(&path_str));
+                        info.as_raw()
+                    }
+                    ResponseTargetKind::FileObject => {
+                        // Get path from the File object
+                        let path_str: String = response_target_val.funcall("path", ())?;
+
+                        write_to_file_gvl_free(&path_str, 0, &response.body)?;
+
+                        // Build response_target_info: { type: :file, path: "<path>" }
+                        let info = RHash::new();
+                        let _ = info.aset(Symbol::new("type"), Symbol::new("file"));
+                        let _ = info.aset(Symbol::new("path"), ruby.str_new(&path_str));
+                        info.as_raw()
+                    }
+                    ResponseTargetKind::OffsetFile => {
+                        // Extract :path and :offset from hash
+                        let hash = RHash::from_value(response_target_val).unwrap();
+                        let path_val: Option<Value> = hash.lookup(Symbol::new("path"))?;
+                        let path_str: String = magnus::TryConvert::try_convert(path_val.unwrap())?;
+                        let offset_val: Option<Value> = hash.lookup(Symbol::new("offset"))?;
+                        let offset: i64 = magnus::TryConvert::try_convert(offset_val.unwrap())?;
+
+                        write_to_file_gvl_free(&path_str, offset as u64, &response.body)?;
+
+                        // Build response_target_info: { type: :offset_file, path: "<path>", offset: <n> }
+                        let info = RHash::new();
+                        let _ = info.aset(Symbol::new("type"), Symbol::new("offset_file"));
+                        let _ = info.aset(Symbol::new("path"), ruby.str_new(&path_str));
+                        let _ = info.aset(Symbol::new("offset"), ruby.into_value(offset));
+                        info.as_raw()
+                    }
+                };
+
+                // On success: body is empty SharableStringIO
+                let empty_sio = SharableStringIO::new_with_buffer(Vec::new());
+
+                let resp_obj = RubyHttpResponse::new_from_parts(
+                    response.status_code,
+                    rb_headers.as_raw(),
+                    empty_sio.as_value().as_raw(),
+                    checksum_algorithm,
+                    computed_checksum,
+                    response_target_info_raw,
+                );
+                Ok(resp_obj.as_value())
+            } else {
+                // Non-success: ignore target, return body normally
+                // Body format depends on streaming_io setting
+                let rb_body_raw: rb_sys::VALUE = if streaming_io {
+                    // streaming_io: true → SharableStringIO
+                    let sio = SharableStringIO::new_with_buffer(response.body);
+                    sio.as_value().as_raw()
+                } else {
+                    // streaming_io: false (default) → String
+                    let rb_body = ruby.str_from_slice(&response.body);
+                    rb_body.as_value().as_raw()
+                };
+
+                let resp_obj = RubyHttpResponse::new_from_parts(
+                    response.status_code,
+                    rb_headers.as_raw(),
+                    rb_body_raw,
+                    checksum_algorithm,
+                    computed_checksum,
+                    rb_sys::Qnil as VALUE,
+                );
+                Ok(resp_obj.as_value())
+            }
+        } else if streaming_io {
             // streaming_io path: use make_request (buffered), then wrap body
             // in a SharableStringIO.
             let response = http::make_request(
@@ -312,6 +689,7 @@ impl HttpClient {
                 sio.as_value().as_raw(),
                 checksum_algorithm,
                 computed_checksum,
+                rb_sys::Qnil as VALUE,
             );
             Ok(resp_obj.as_value())
         } else if block {
@@ -370,6 +748,7 @@ impl HttpClient {
                 ruby.qnil().as_value().as_raw(),
                 None,
                 None,
+                rb_sys::Qnil as VALUE,
             );
             Ok(resp_obj.as_value())
         } else {
@@ -424,6 +803,7 @@ impl HttpClient {
                 rb_body.as_value().as_raw(),
                 checksum_algorithm,
                 computed_checksum,
+                rb_sys::Qnil as VALUE,
             );
             Ok(resp_obj.as_value())
         }
