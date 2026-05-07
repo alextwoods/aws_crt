@@ -115,6 +115,10 @@ module AwsCrt
     #   with (status, headers_hash) when headers arrive
     # @option credentials [Array<String>] :checksum_algorithms (nil)
     #   Algorithms to compute over the response body
+    # @option credentials [String, Pathname, File, Proc, Hash] :response_target (nil)
+    #   Where to write the response body on 2xx success. Accepts a file path
+    #   (String/Pathname), File object, Proc (called with body and headers),
+    #   or Hash with :path and :offset keys for offset writes.
     #
     # @yield [chunk] For streaming responses, yields each body chunk
     # @yieldparam chunk [String] A chunk of the response body
@@ -137,6 +141,7 @@ module AwsCrt
       kwargs[:on_data] = options[:on_data] if options.key?(:on_data)
       kwargs[:on_headers] = options[:on_headers] if options.key?(:on_headers)
       kwargs[:checksum_algorithms] = options[:checksum_algorithms] if options.key?(:checksum_algorithms)
+      kwargs[:response_target] = options[:response_target] if options.key?(:response_target)
 
       if block
         _native_request(endpoint, method, path, headers, body, **kwargs, &block)

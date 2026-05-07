@@ -37,7 +37,7 @@ use crate::http::{
     aws_http_message_set_request_method, aws_http_message_set_request_path,
     aws_input_stream_new_from_cursor, aws_input_stream_release,
 };
-use crate::http_client::compute_checksum;
+use crate::http_client::{compute_checksum, validate_response_target, write_to_file_gvl_free, ResponseTargetKind};
 use crate::proxy::{ProxyAuthType, ProxyOptions};
 use crate::sharable_string_io::SharableStringIO;
 use crate::sigv4_signer::sign_crt_message;
@@ -195,13 +195,13 @@ impl SignedHttpClient {
         let body_val = args.optional.0;
 
         // Extract keyword arguments
-        let kwargs = get_kwargs::<_, (String, String, String), (Option<String>, Option<bool>, Option<Value>, Option<Value>, Option<Value>), ()>(
+        let kwargs = get_kwargs::<_, (String, String, String), (Option<String>, Option<bool>, Option<Value>, Option<Value>, Option<Value>, Option<Value>), ()>(
             args.keywords,
             &["region", "access_key_id", "secret_access_key"],
-            &["session_token", "streaming_io", "on_data", "on_headers", "checksum_algorithms"],
+            &["session_token", "streaming_io", "on_data", "on_headers", "checksum_algorithms", "response_target"],
         )?;
         let (region, access_key_id, secret_access_key) = kwargs.required;
-        let (session_token, streaming_io_opt, on_data_opt, on_headers_opt, checksum_algorithms_opt) = kwargs.optional;
+        let (session_token, streaming_io_opt, on_data_opt, on_headers_opt, checksum_algorithms_opt, response_target_opt) = kwargs.optional;
         let streaming_io = streaming_io_opt.unwrap_or(false);
 
         // Extract on_data listeners (Array of Procs or nil)
@@ -267,6 +267,22 @@ impl SignedHttpClient {
             return Err(Error::new(
                 magnus::exception::arg_error(),
                 "streaming_io and block are mutually exclusive",
+            ));
+        }
+
+        // Validate response_target if provided
+        let response_target_kind: Option<ResponseTargetKind> = match &response_target_opt {
+            Some(v) if !v.is_nil() => {
+                Some(validate_response_target(ruby, *v)?)
+            }
+            _ => None,
+        };
+
+        // Validate: response_target and block are mutually exclusive
+        if response_target_kind.is_some() && block {
+            return Err(Error::new(
+                magnus::exception::arg_error(),
+                "response_target and block are mutually exclusive",
             ));
         }
 
@@ -417,7 +433,151 @@ impl SignedHttpClient {
         }
 
         // --- Send the signed message directly ---
-        if streaming_io {
+        if let Some(ref target_kind) = response_target_kind {
+            // response_target path: always buffered, dispatch to target on 2xx
+            let response = unsafe {
+                http::send_pre_built_request(
+                    cm_ptr,
+                    request,
+                    body_stream,
+                    body_data,
+                    read_timeout_ms,
+                )
+            }
+            .map_err(|e| -> Error { e.into() })?;
+
+            // Compute checksum over the body buffer
+            let (checksum_algorithm, computed_checksum) =
+                compute_checksum(&checksum_algorithms, &response.headers, &response.body);
+
+            let rb_headers = build_ruby_headers(ruby, &response.headers);
+
+            // Call on_headers listeners
+            if let Some(ref listeners) = on_headers_listeners {
+                let status_val = ruby.into_value(response.status_code);
+                let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                let len = listeners.len();
+                for i in 0..len {
+                    let listener: Value = unsafe {
+                        Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                    };
+                    let _: Value = listener.funcall("call", (status_val, rb_headers_value))?;
+                }
+            }
+
+            // Notify on_data listeners with the complete body
+            if let Some(ref listeners) = on_data_listeners {
+                if !response.body.is_empty() {
+                    let rb_chunk = ruby.str_from_slice(&response.body);
+                    let len = listeners.len();
+                    for i in 0..len {
+                        let listener: Value = unsafe {
+                            Value::from_raw(*rb_sys::RARRAY_CONST_PTR(listeners.as_raw()).add(i))
+                        };
+                        let _: Value = listener.funcall("call", (rb_chunk,))?;
+                    }
+                }
+            }
+
+            // Check status code: dispatch to target on 2xx, ignore on non-2xx
+            let is_success = (200..=299).contains(&response.status_code);
+            let response_target_val = response_target_opt.unwrap();
+
+            if is_success {
+                // Dispatch to target based on kind
+                let response_target_info_raw: rb_sys::VALUE = match target_kind {
+                    ResponseTargetKind::Proc => {
+                        // Call the Proc with (body_string, headers_hash)
+                        let rb_body_str = ruby.str_from_slice(&response.body);
+                        let rb_headers_value: Value = unsafe { Value::from_raw(rb_headers.as_raw()) };
+                        let _: Value = response_target_val.funcall("call", (rb_body_str, rb_headers_value))?;
+
+                        // Build response_target_info: { type: :proc }
+                        let info = RHash::new();
+                        let _ = info.aset(Symbol::new("type"), Symbol::new("proc"));
+                        info.as_raw()
+                    }
+                    ResponseTargetKind::FilePath => {
+                        // Extract path string — handle both String and Pathname
+                        let path_str: String = if response_target_val.is_kind_of(ruby.class_string()) {
+                            magnus::TryConvert::try_convert(response_target_val)?
+                        } else {
+                            // Pathname — call to_s
+                            response_target_val.funcall("to_s", ())?
+                        };
+
+                        write_to_file_gvl_free(&path_str, 0, &response.body)?;
+
+                        // Build response_target_info: { type: :file, path: "<path>" }
+                        let info = RHash::new();
+                        let _ = info.aset(Symbol::new("type"), Symbol::new("file"));
+                        let _ = info.aset(Symbol::new("path"), ruby.str_new(&path_str));
+                        info.as_raw()
+                    }
+                    ResponseTargetKind::FileObject => {
+                        // Get path from the File object
+                        let path_str: String = response_target_val.funcall("path", ())?;
+
+                        write_to_file_gvl_free(&path_str, 0, &response.body)?;
+
+                        // Build response_target_info: { type: :file, path: "<path>" }
+                        let info = RHash::new();
+                        let _ = info.aset(Symbol::new("type"), Symbol::new("file"));
+                        let _ = info.aset(Symbol::new("path"), ruby.str_new(&path_str));
+                        info.as_raw()
+                    }
+                    ResponseTargetKind::OffsetFile => {
+                        // Extract :path and :offset from hash
+                        let hash = RHash::from_value(response_target_val).unwrap();
+                        let path_val: Option<Value> = hash.lookup(Symbol::new("path"))?;
+                        let path_str: String = magnus::TryConvert::try_convert(path_val.unwrap())?;
+                        let offset_val: Option<Value> = hash.lookup(Symbol::new("offset"))?;
+                        let offset: i64 = magnus::TryConvert::try_convert(offset_val.unwrap())?;
+
+                        write_to_file_gvl_free(&path_str, offset as u64, &response.body)?;
+
+                        // Build response_target_info: { type: :offset_file, path: "<path>", offset: <n> }
+                        let info = RHash::new();
+                        let _ = info.aset(Symbol::new("type"), Symbol::new("offset_file"));
+                        let _ = info.aset(Symbol::new("path"), ruby.str_new(&path_str));
+                        let _ = info.aset(Symbol::new("offset"), ruby.into_value(offset));
+                        info.as_raw()
+                    }
+                };
+
+                // On success: body is empty SharableStringIO
+                let empty_sio = SharableStringIO::new_with_buffer(Vec::new());
+
+                let resp_obj = crate::http_response::HttpResponse::new_from_parts(
+                    response.status_code,
+                    rb_headers.as_raw(),
+                    empty_sio.as_value().as_raw(),
+                    checksum_algorithm,
+                    computed_checksum,
+                    response_target_info_raw,
+                );
+                Ok(resp_obj.as_value())
+            } else {
+                // Non-success: ignore target, return body normally
+                let rb_body_raw: rb_sys::VALUE = if streaming_io {
+                    let sio = SharableStringIO::new_with_buffer(response.body);
+                    sio.as_value().as_raw()
+                } else {
+                    let rb_body = ruby.str_from_slice(&response.body);
+                    rb_body.as_value().as_raw()
+                };
+
+                let resp_obj = crate::http_response::HttpResponse::new_from_parts(
+                    response.status_code,
+                    rb_headers.as_raw(),
+                    rb_body_raw,
+                    checksum_algorithm,
+                    computed_checksum,
+                    rb_sys::Qnil as VALUE,
+                );
+                Ok(resp_obj.as_value())
+            }
+        } else if streaming_io {
             // streaming_io path: send buffered, wrap body in SharableStringIO
             let response = unsafe {
                 http::send_pre_built_request(
