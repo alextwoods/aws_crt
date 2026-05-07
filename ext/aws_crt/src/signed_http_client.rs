@@ -29,6 +29,7 @@ use rb_sys::VALUE;
 use crate::connection_manager::{ConnectionManager, ConnectionManagerOptions};
 use crate::credentials::CredentialsProvider;
 use crate::error::CrtError;
+use crate::file_part::FilePart;
 use crate::http::{
     self, AwsByteCursor, AwsHttpHeader, AwsInputStream,
     aws_default_allocator, aws_http_message_add_header, aws_http_message_new_request,
@@ -301,13 +302,21 @@ impl SignedHttpClient {
         }
 
         // Get body bytes (copy into Rust before releasing GVL)
+        // Supports: String, FilePart, or nil
         let body_bytes: Option<Vec<u8>> = match body_val {
             Some(v) if !v.is_nil() => {
-                let s = RString::from_value(v).ok_or_else(|| {
-                    Error::new(magnus::exception::type_error(), "body must be a String or nil")
-                })?;
-                let slice = unsafe { s.as_slice() };
-                if slice.is_empty() { None } else { Some(slice.to_vec()) }
+                // Check if it's a FilePart (optimized native path)
+                if let Ok(fp) = <typed_data::Obj<FilePart>>::try_convert(v) {
+                    let bytes = FilePart::read_bytes(&fp)?;
+                    if bytes.is_empty() { None } else { Some(bytes) }
+                } else {
+                    // Treat as String
+                    let s = RString::from_value(v).ok_or_else(|| {
+                        Error::new(magnus::exception::type_error(), "body must be a String, FilePart, or nil")
+                    })?;
+                    let slice = unsafe { s.as_slice() };
+                    if slice.is_empty() { None } else { Some(slice.to_vec()) }
+                }
             }
             _ => None,
         };

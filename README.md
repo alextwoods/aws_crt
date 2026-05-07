@@ -11,6 +11,7 @@ This gem provides:
 - **SigV4 Signer** — A standalone CRT-backed SigV4 request signer. The entire signing operation (canonical request, string-to-sign, signature, header injection) happens in native code with the GVL released during the async CRT signing callback.
 - **Signed HTTP Client** — A combined signer + HTTP client that signs and sends requests in a single native call. Avoids crossing the Ruby/Rust boundary twice, eliminating intermediate type conversions and an extra GVL release/acquire cycle.
 - **S3 Client** — A standalone high-performance S3 client backed by the CRT's `aws-c-s3` meta-request system. Provides automatic request splitting (parallel multipart upload/download), per-chunk retries, and parallel file I/O for significantly higher throughput on large object transfers.
+- **FilePart** — A Ractor-safe, read-only IO object that provides an interface to a byte range within a file. Optimized as a request body type — file bytes are read directly in Rust with the GVL released, avoiding Ruby String allocations. Drop-in replacement for `Aws::S3::FilePart`.
 - **Ractor Support** — The HTTP client, signed HTTP client, and other key types are Ractor-shareable when frozen, enabling true parallel execution across Ruby 4 Ractors.
 
 The native extension is written in Rust (using [magnus](https://github.com/matsadler/magnus)
@@ -415,6 +416,81 @@ response.body.write_to_io(buf)
 ```
 
 Both methods return the number of bytes written.
+
+#### FilePart (request body)
+
+`AwsCrt::Http::FilePart` provides an IO-like interface to a byte range within
+a file on disk. It is Ractor-shareable, frozen by default, and optimized for
+use as a request body — the HTTP client reads file bytes directly in Rust
+with the GVL released, avoiding Ruby String allocations entirely.
+
+This is a drop-in replacement for `Aws::S3::FilePart` from the AWS SDK,
+but with Ractor safety and native performance.
+
+```ruby
+require "aws_crt"
+
+# Create a FilePart representing bytes 1024..2047 of a file
+part = AwsCrt::Http::FilePart.new(
+  source: "/path/to/large-file.bin",
+  offset: 1024,
+  size: 1024
+)
+
+# Use as a request body — optimized native path (no Ruby String allocation)
+response = client.request(
+  "https://example.com", "PUT", "/upload",
+  [["Host", "example.com"], ["Content-Length", "1024"]],
+  part
+)
+
+# Also works as a standard IO object (for checksums, Net::HTTP, etc.)
+data = part.read       # => 1024 bytes from offset 1024
+part.rewind
+chunk = part.read(256) # => first 256 bytes of the part
+part.size              # => 1024
+part.eof?              # => false (until all bytes are read)
+
+# Ractor-safe
+Ractor.shareable?(part) # => true
+part.frozen?            # => true
+```
+
+**Constructor parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `source` | String | Path to the source file |
+| `offset` | Integer | Byte offset where this part starts (must be ≥ 0) |
+| `size` | Integer | Number of bytes in this part (must be ≥ 0) |
+
+**Instance methods:**
+
+| Method | Description |
+|--------|-------------|
+| `read(length = nil, outbuf = nil)` | Read bytes (IO#read semantics) |
+| `rewind` | Reset read position to 0 |
+| `size` / `length` | Declared part size in bytes |
+| `pos` / `tell` | Current read position |
+| `pos=` | Set read position (clamps to size) |
+| `eof?` | True when all bytes have been read |
+| `source` | Source file path |
+| `offset` | Byte offset in the source file |
+| `string` | Entire part contents as a frozen String |
+| `close` | No-op (for IO compatibility) |
+| `closed?` | Always false |
+
+**Performance characteristics:**
+- File bytes are read lazily on first `read` call (GVL released during I/O)
+- Once loaded, subsequent reads are served from an in-memory cache
+- When passed as a request body to `Http::Client`, bytes are read directly
+  in Rust without crossing the Ruby boundary
+- The object is frozen and Ractor-shareable — safe to pass between Ractors
+
+**Use cases:**
+- Parallel multipart uploads (each part reads a different byte range)
+- Chunked file processing with checksums
+- Ractor-based parallel upload pipelines
 
 #### Error classes
 
@@ -839,6 +915,7 @@ body_io.read  # => response bytes, read in the main Ractor
 | Sign requests without sending | `AwsCrt::Sigv4Signer` | Inspect/modify signed headers |
 | Sign and send in one shot | `AwsCrt::SignedHttpClient` | Best performance for sign+send |
 | High-throughput S3 transfers | `AwsCrt::S3::Client` | Parallel multipart, per-chunk retries |
+| Partial file reads as request body | `AwsCrt::Http::FilePart` | Ractor-safe, native file I/O |
 | Hardware-accelerated checksums | `AwsCrt::Checksums` | CRC32, CRC32C, CRC64-NVME |
 | Fast CBOR serialization | `AwsCrt::Cbor` | Drop-in for `Aws::Cbor` |
 
@@ -1025,6 +1102,7 @@ bundle exec rake install
 │  src/cbor.rs              CBOR encode/decode             │
 │  src/http.rs              request/response execution     │
 │  src/http_client.rs       Ruby-facing HTTP client class  │
+│  src/file_part.rs         Ractor-safe file byte range IO │
 │  src/connection_manager.rs  CRT connection pool wrapper  │
 │  src/sigv4_signer.rs      SigV4 signing (standalone)     │
 │  src/signed_http_client.rs  combined sign + send         │

@@ -87,6 +87,9 @@ module AwsCrt
       def read_body(body)
         return nil if body.nil?
 
+        # FilePart is passed directly — the native client handles it optimally
+        return body if body.is_a?(AwsCrt::Http::FilePart)
+
         data = body.respond_to?(:read) ? body.read : body.to_s
         body.rewind if body.respond_to?(:rewind)
         data.empty? ? nil : data

@@ -15,6 +15,7 @@ pub mod s3_client;
 pub mod s3_request;
 pub mod s3_ruby;
 pub mod ractor_test;
+pub mod file_part;
 pub mod sharable_string_io;
 pub mod signing;
 pub mod signed_http_client;
@@ -199,6 +200,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     http_client::define_http_client(ruby, &http)?;
     http_response::define_http_response(ruby, &http)?;
     sharable_string_io::define_sharable_string_io(ruby, &http)?;
+    file_part::define_file_part(ruby, &http)?;
 
     // S3 module
     let s3 = module.define_module("S3")?;

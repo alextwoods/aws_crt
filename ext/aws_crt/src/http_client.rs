@@ -34,6 +34,7 @@ extern "C" {
 }
 
 use crate::connection_manager::{ConnectionManager, ConnectionManagerOptions};
+use crate::file_part::FilePart;
 use crate::http;
 use crate::http_response::HttpResponse as RubyHttpResponse;
 use crate::proxy::{ProxyAuthType, ProxyOptions};
@@ -350,12 +351,12 @@ impl HttpClient {
         rb_self: typed_data::Obj<Self>,
         args: &[Value],
     ) -> Result<Value, Error> {
-        let args = scan_args::<(String, String, String, RArray), (Option<RString>,), (), (), RHash, ()>(args)?;
+        let args = scan_args::<(String, String, String, RArray), (Option<Value>,), (), (), RHash, ()>(args)?;
         let endpoint = args.required.0;
         let method = args.required.1;
         let path = args.required.2;
         let headers = args.required.3;
-        let body = args.optional.0;
+        let body_val = args.optional.0;
 
         // Extract keyword arguments
         let kwargs = get_kwargs::<_, (), (Option<bool>, Option<Value>, Option<Value>, Option<Value>, Option<Value>), ()>(
@@ -478,10 +479,24 @@ impl HttpClient {
         }
 
         // Get body bytes (copy into Rust before releasing GVL)
-        let body_bytes: Option<Vec<u8>> = match body {
-            Some(s) if !s.is_nil() => {
-                let slice = unsafe { s.as_slice() };
-                Some(slice.to_vec())
+        // Supports: String, FilePart, or nil
+        let body_bytes: Option<Vec<u8>> = match body_val {
+            Some(v) if !v.is_nil() => {
+                // Check if it's a FilePart (optimized native path)
+                if let Ok(fp) = <typed_data::Obj<FilePart>>::try_convert(v) {
+                    let bytes = FilePart::read_bytes(&fp)?;
+                    if bytes.is_empty() { None } else { Some(bytes) }
+                } else {
+                    // Treat as String (or convert to String)
+                    let s = RString::from_value(v).ok_or_else(|| {
+                        Error::new(
+                            magnus::exception::type_error(),
+                            "body must be a String, FilePart, or nil",
+                        )
+                    })?;
+                    let slice = unsafe { s.as_slice() };
+                    if slice.is_empty() { None } else { Some(slice.to_vec()) }
+                }
             }
             _ => None,
         };
