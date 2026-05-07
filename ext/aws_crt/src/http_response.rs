@@ -3,9 +3,29 @@
 //! A simple data object representing an HTTP response with status code,
 //! headers, body, and optional checksum information. This is a transient
 //! response object — it is NOT frozen or Ractor-shareable.
+//!
+//! ## GC Safety (Ractor + Compaction)
+//!
+//! This struct stores raw `rb_sys::VALUE` fields that reference Ruby heap
+//! objects (headers hash, body string/SharableStringIO, response_target_info
+//! hash). These must be properly marked during GC so they are not collected.
+//!
+//! We use `magnus::gc::Marker::mark` (which calls `rb_gc_mark`) to pin the
+//! referenced objects — this prevents Ruby's compacting GC from moving them,
+//! ensuring our stored raw VALUE pointers remain valid for the struct's
+//! lifetime.
+//!
+//! **Important**: `free_immediately` is intentionally NOT used here. In a
+//! multi-Ractor environment with Ruby 4.0's per-Ractor GC, `free_immediately`
+//! can cause the Rust struct to be dropped during a GC sweep phase while
+//! another Ractor's GC is concurrently scanning or compacting. This creates
+//! a race where the `mark()` callback could be invoked on a partially-freed
+//! struct, or where stored VALUEs are accessed after the objects they point
+//! to have been moved/freed. Without `free_immediately`, Ruby defers freeing
+//! to a safe point where no concurrent GC operations are in progress.
 
 use magnus::prelude::*;
-use magnus::rb_sys::{AsRawValue, FromRawValue};
+use magnus::rb_sys::FromRawValue;
 use magnus::typed_data::{self, DataType, DataTypeFunctions, TypedData};
 use magnus::value::Lazy;
 use magnus::{data_type_builder, method, Error, RClass, Ruby, Value};
@@ -18,7 +38,7 @@ use magnus::{data_type_builder, method, Error, RClass, Ruby, Value};
 ///
 /// A simple data object holding the HTTP response fields.
 /// Ruby VALUEs (headers, body) are stored as raw rb_sys::VALUE and
-/// marked for GC via rb_gc_mark in the mark callback.
+/// marked/pinned for GC via the `mark()` callback.
 pub struct HttpResponse {
     /// The HTTP status code (e.g. 200, 404).
     status_code: i32,
@@ -43,12 +63,14 @@ pub struct HttpResponse {
 unsafe impl Send for HttpResponse {}
 
 impl DataTypeFunctions for HttpResponse {
-    fn mark(&self, _marker: &magnus::gc::Marker) {
-        // Mark the stored Ruby VALUEs so GC doesn't collect them
+    fn mark(&self, marker: &magnus::gc::Marker) {
+        // Mark (and pin) the stored Ruby VALUEs so GC doesn't collect or
+        // move them. Using Marker::mark pins the objects, preventing
+        // compaction from relocating them while we hold raw VALUE pointers.
         unsafe {
-            rb_sys::rb_gc_mark(self.headers);
-            rb_sys::rb_gc_mark(self.body);
-            rb_sys::rb_gc_mark(self.response_target_info);
+            marker.mark(Value::from_raw(self.headers));
+            marker.mark(Value::from_raw(self.body));
+            marker.mark(Value::from_raw(self.response_target_info));
         }
     }
 }
@@ -70,7 +92,6 @@ unsafe impl TypedData for HttpResponse {
     fn data_type() -> &'static DataType {
         static DATA_TYPE: DataType =
             data_type_builder!(HttpResponse, "AwsCrt::Http::Response")
-                .free_immediately()
                 .mark()
                 .build();
         &DATA_TYPE
