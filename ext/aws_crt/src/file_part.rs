@@ -78,9 +78,15 @@ unsafe impl TypedData for FilePart {
     }
 
     fn data_type() -> &'static DataType {
+        // NOTE: `free_immediately` is intentionally NOT used here.
+        // FilePart#read calls ensure_loaded() which releases the GVL via
+        // rb_thread_call_without_gvl for file I/O. While the GVL is released,
+        // the GC may run and — if it determines the object is unreachable —
+        // would free the Rust struct during sweep. This creates a use-after-
+        // free when the GVL-free function returns. Without free_immediately,
+        // Ruby defers the free to a safe point after the method has returned.
         static DATA_TYPE: DataType =
             data_type_builder!(FilePart, "AwsCrt::Http::FilePart")
-                .free_immediately()
                 .frozen_shareable()
                 .build();
         &DATA_TYPE

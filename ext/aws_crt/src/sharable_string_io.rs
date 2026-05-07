@@ -71,9 +71,16 @@ unsafe impl TypedData for SharableStringIO {
     }
 
     fn data_type() -> &'static DataType {
+        // NOTE: `free_immediately` is intentionally NOT used here.
+        // SharableStringIO methods (write_to_file, write_to_io) release the
+        // GVL via rb_thread_call_without_gvl. While the GVL is released, the
+        // GC may run and — if it determines the object is unreachable — would
+        // free the Rust struct during sweep. This creates a use-after-free
+        // when the GVL-free function returns and the method tries to access
+        // the (now-freed) TypedData. Without free_immediately, Ruby defers
+        // the free to a safe point after the method has returned.
         static DATA_TYPE: DataType =
             data_type_builder!(SharableStringIO, "AwsCrt::Http::SharableStringIO")
-                .free_immediately()
                 .frozen_shareable()
                 .build();
         &DATA_TYPE
